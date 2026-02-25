@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+google-cloud-logging
+firebase-admin
+cryptography
+google-cloud-secret-manager

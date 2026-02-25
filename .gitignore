@@ -1,0 +1,23 @@
+.env
+.env.local
+.env.*.local
+
+# OAuth / local credential files
+credentials.json
+*credentials*.json
+service-account*.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local editor/system files
+.DS_Store
+Thumbs.db
