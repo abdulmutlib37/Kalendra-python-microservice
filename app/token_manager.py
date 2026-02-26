@@ -1,11 +1,8 @@
 """
 Token management for Google/Outlook OAuth tokens.
 
-Features:
-- Encrypts tokens at rest using Fernet.
-- Stores encrypted tokens in Firestore collection `user_tokens`.
-- Refreshes expired tokens automatically for Google and Outlook.
-- Supports token revocation for disconnection flows.
+Tokens are stored only inside the `threads` subcollection under a2h-emailing/config.
+No standalone user_tokens collection is used.
 """
 
 import os
@@ -14,31 +11,64 @@ from typing import Optional
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
+from google.auth.transport.requests import Request
 from google.cloud import secretmanager
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from google.oauth2.credentials import Credentials
 
 from app.firestore_client import get_db
 from app.logging_config import log_event
+from app.repository import create_thread
+
+ROOT_DOC = "a2h-emailing/config"
 
 
 class TokenManager:
-    COLLECTION = "user_tokens"
     REFRESH_BUFFER_SECONDS = 300
 
     def __init__(self) -> None:
         self.db = get_db()
         self._cipher: Optional[Fernet] = None
 
-    def _doc_id(self, user_email: str, provider: str) -> str:
-        return f"{provider.lower()}::{user_email.lower()}"
+    def _threads_col(self):
+        return self.db.document(ROOT_DOC).collection("threads")
+
+    def _matching_threads(self, user_email: str, provider: str):
+        return (
+            self._threads_col()
+            .where("provider", "==", provider.lower())
+            .where("user_email", "==", user_email.lower())
+            .stream()
+        )
+
+    @staticmethod
+    def _thread_suffix(doc_id: str) -> int:
+        try:
+            return int(doc_id.rsplit("::", 1)[1])
+        except Exception:
+            return -1
+
+    def _latest_thread_doc(self, user_email: str, provider: str):
+        docs = list(self._matching_threads(user_email, provider))
+        if not docs:
+            return None
+        docs.sort(key=lambda d: self._thread_suffix(d.id), reverse=True)
+        return docs[0]
+
+    def _latest_thread_with_tokens(self, user_email: str, provider: str):
+        docs = list(self._matching_threads(user_email, provider))
+        docs.sort(key=lambda d: self._thread_suffix(d.id), reverse=True)
+        for doc in docs:
+            data = doc.to_dict() or {}
+            if data.get("refresh_token_encrypted"):
+                return doc
+        return None
 
     def _get_fernet_key(self) -> str:
-        # Prefer direct env injection for runtime speed.
         key = os.getenv("FERNET_KEY") or os.getenv("TOKEN_ENCRYPTION_KEY")
         if key:
             return key
 
-        # Fallback: fetch from Secret Manager.
         secret_name = os.getenv("TOKEN_ENCRYPTION_SECRET_NAME")
         if not secret_name:
             raise ValueError(
@@ -50,7 +80,6 @@ class TokenManager:
         else:
             project_id = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
             if not project_id:
-                # Firestore client knows the active project in Cloud Run/ADC contexts.
                 project_id = getattr(self.db, "project", None)
             if not project_id:
                 raise ValueError(
@@ -89,21 +118,52 @@ class TokenManager:
         scope: Optional[str] = None,
     ) -> bool:
         try:
+            access_token = access_token.strip()
+            refresh_token = refresh_token.strip()
+            if not access_token or not refresh_token:
+                log_event(
+                    "token_store_invalid_input",
+                    provider=provider,
+                    user_email=user_email.lower(),
+                    error="empty_access_or_refresh_token",
+                )
+                return False
+            if "<" in access_token or ">" in access_token or "<" in refresh_token or ">" in refresh_token:
+                log_event(
+                    "token_store_invalid_input",
+                    provider=provider,
+                    user_email=user_email.lower(),
+                    error="token_looks_like_placeholder",
+                )
+                return False
+
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
             doc = {
-                "user_email": user_email.lower(),
                 "provider": provider.lower(),
+                "user_email": user_email.lower(),
                 "access_token_encrypted": self._encrypt(access_token),
                 "refresh_token_encrypted": self._encrypt(refresh_token),
-                "scope": scope,
-                "status": "active",
                 "expires_at": expires_at,
                 "updated_at": SERVER_TIMESTAMP,
                 "created_at": SERVER_TIMESTAMP,
             }
-            self.db.collection(self.COLLECTION).document(
-                self._doc_id(user_email, provider)
-            ).set(doc, merge=True)
+            target = self._latest_thread_doc(user_email, provider)
+            if target is None:
+                created = create_thread(
+                    provider=provider,
+                    user_email=user_email,
+                    data={
+                        "status": "active",
+                        "state": "open",
+                    },
+                )
+                if not created.get("ok"):
+                    raise ValueError(created.get("error", "thread_create_failed"))
+                target_id = created["data"]["thread_doc_id"]
+            else:
+                target_id = target.id
+
+            self._threads_col().document(target_id).set(doc, merge=True)
             log_event("token_stored", provider=provider, user_email=user_email.lower())
             return True
         except Exception as exc:
@@ -117,18 +177,14 @@ class TokenManager:
 
     def get_fresh_token(self, user_email: str, provider: str) -> Optional[str]:
         provider = provider.lower()
-        doc_ref = self.db.collection(self.COLLECTION).document(self._doc_id(user_email, provider))
 
         try:
-            snap = doc_ref.get()
-            if not snap.exists:
+            snap = self._latest_thread_with_tokens(user_email, provider)
+            if snap is None:
                 log_event("token_not_found", provider=provider, user_email=user_email.lower())
                 return None
 
             data = snap.to_dict() or {}
-            if data.get("status") == "revoked":
-                log_event("token_revoked_state", provider=provider, user_email=user_email.lower())
-                return None
 
             access_token = self._decrypt(data.get("access_token_encrypted", ""))
             refresh_token = self._decrypt(data.get("refresh_token_encrypted", ""))
@@ -140,7 +196,6 @@ class TokenManager:
 
             now = datetime.now(timezone.utc)
             if expires_at and isinstance(expires_at, datetime):
-                # Firestore timestamps may be naive in some environments; normalize to UTC.
                 if expires_at.tzinfo is None:
                     expires_at = expires_at.replace(tzinfo=timezone.utc)
 
@@ -183,18 +238,17 @@ class TokenManager:
     def revoke_token(self, user_email: str, provider: str) -> bool:
         provider = provider.lower()
         try:
-            doc_ref = self.db.collection(self.COLLECTION).document(self._doc_id(user_email, provider))
-            doc_ref.set(
-                {
-                    "status": "revoked",
-                    "access_token_encrypted": None,
-                    "refresh_token_encrypted": None,
-                    "expires_at": None,
-                    "revoked_at": SERVER_TIMESTAMP,
-                    "updated_at": SERVER_TIMESTAMP,
-                },
-                merge=True,
-            )
+            docs = list(self._matching_threads(user_email, provider))
+            for doc in docs:
+                self._threads_col().document(doc.id).set(
+                    {
+                        "access_token_encrypted": None,
+                        "refresh_token_encrypted": None,
+                        "expires_at": None,
+                        "updated_at": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
             log_event("token_revoked", provider=provider, user_email=user_email.lower())
             return True
         except Exception as exc:
@@ -215,12 +269,36 @@ class TokenManager:
         return None
 
     def _refresh_google(self, refresh_token: str) -> Optional[dict]:
-        client_id = os.getenv("GOOGLE_CLIENT_ID")
-        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        client_id = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
+        client_secret = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+        refresh_token = (refresh_token or "").strip()
         if not client_id or not client_secret:
             log_event("google_refresh_config_missing")
             return None
 
+        # First try Google's native credential refresh flow.
+        try:
+            creds = Credentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+            creds.refresh(Request())
+            if creds.token:
+                expires_in = 3600
+                if creds.expiry:
+                    expires_in = max(60, int((creds.expiry - datetime.now(timezone.utc)).total_seconds()))
+                return {
+                    "access_token": creds.token,
+                    "expires_in": expires_in,
+                    "scope": " ".join(creds.scopes or []),
+                }
+        except Exception as exc:
+            log_event("google_refresh_google_auth_exception", error=str(exc))
+
+        # Fallback to direct token endpoint for parity with earlier behavior.
         data = {
             "client_id": client_id,
             "client_secret": client_secret,
