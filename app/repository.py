@@ -13,6 +13,7 @@ and returns a consistent dict: {"ok": bool, "data": ...} or {"ok": bool, "error"
 import threading
 from datetime import datetime, timezone
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore as g_firestore
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
@@ -97,6 +98,16 @@ def get_thread(doc_id: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def delete_thread(doc_id: str) -> dict:
+    try:
+        _threads_col().document(doc_id).delete()
+        log_event("thread_deleted", thread_doc_id=doc_id)
+        return {"ok": True}
+    except Exception as e:
+        log_event("thread_delete_failed", thread_doc_id=doc_id, error=str(e))
+        return {"ok": False, "error": str(e)}
+
+
 def create_thread(provider: str, user_email: str, data: dict) -> dict:
     """Create a new thread with an auto-incremented ID."""
     try:
@@ -104,6 +115,62 @@ def create_thread(provider: str, user_email: str, data: dict) -> dict:
         return save_thread(doc_id, {**data, "provider": provider.lower(), "user_email": user_email.lower()})
     except Exception as e:
         log_event("thread_create_failed", error=str(e))
+        return {"ok": False, "error": str(e)}
+
+
+def find_thread_by_gmail_thread(provider: str, user_email: str, gmail_thread_id: str) -> dict:
+    """
+    Find the internal thread doc that maps to a Gmail thread id for a user.
+    Uses in-memory filtering to avoid Firestore composite-index requirements.
+    """
+    prefix = f"{provider.lower()}::{user_email.lower()}::"
+    try:
+        for doc in _threads_col().stream():
+            if not doc.id.startswith(prefix):
+                continue
+            data = doc.to_dict() or {}
+            if str(data.get("gmail_thread_id", "")).strip() == str(gmail_thread_id).strip():
+                return {"ok": True, "data": {"thread_doc_id": doc.id, **data}}
+        return {"ok": False, "error": "not_found"}
+    except Exception as e:
+        log_event(
+            "thread_find_by_gmail_thread_failed",
+            provider=provider,
+            user_email=user_email.lower(),
+            gmail_thread_id=gmail_thread_id,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
+
+
+def mark_thread_message_processed(thread_doc_id: str, message_id: str) -> dict:
+    """
+    Idempotency guard for Gmail push processing.
+    Creates a child doc once; if it already exists, message was already processed.
+    """
+    try:
+        processed_ref = (
+            _threads_col()
+            .document(thread_doc_id)
+            .collection("processed_messages")
+            .document(message_id)
+        )
+        processed_ref.create(
+            {
+                "message_id": message_id,
+                "processed_at": datetime.now(timezone.utc),
+            }
+        )
+        return {"ok": True, "data": {"already_processed": False}}
+    except AlreadyExists:
+        return {"ok": True, "data": {"already_processed": True}}
+    except Exception as e:
+        log_event(
+            "thread_message_processed_mark_failed",
+            thread_doc_id=thread_doc_id,
+            message_id=message_id,
+            error=str(e),
+        )
         return {"ok": False, "error": str(e)}
 
 

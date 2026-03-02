@@ -30,7 +30,11 @@ from app.repository import (
     update_watch_state,
 )
 from app.token_manager import TokenManager
-from app.watch_service import process_gmail_push, renew_gmail_watch
+from app.watch_service import (
+    initiate_google_email_flow,
+    process_gmail_push,
+    renew_gmail_watch,
+)
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
@@ -90,6 +94,14 @@ class TokenActionRequest(BaseModel):
     provider: str = Field(pattern="^(google|outlook)$")
 
 
+class InitiateEmailFlowRequest(BaseModel):
+    google_access_token: str
+    sender_name: str
+    recipient_email: str
+    recipient_name: str
+    context: str | None = None
+
+
 # ── Core routes ──────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -104,7 +116,8 @@ async def root():
             "test_init": "GET /test/init — seed sample Firestore data",
             "test_update": "GET /test/update — update sample thread",
             "renew_watches": "POST /renew-watches — renew expiring Gmail watches",
-            "gmail_push": "POST /gmail/push — process Gmail push and reply 'Noted'",
+            "gmail_push": "POST /gmail/push — process Gmail push with agentic scheduling replies",
+            "initiate_email_flow": "POST /initiate-email-flow — start email scheduling thread (Node-compatible)",
             "test_token_store": "POST /test/token-store — store encrypted OAuth tokens",
             "test_token_refresh": "POST /test/token-refresh — refresh Google/Outlook token",
             "revoke_user_token": "POST /revoke-user-token — revoke stored token",
@@ -284,6 +297,26 @@ async def gmail_push(payload: dict):
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error")}
     return result
+
+
+@app.post("/initiate-email-flow")
+async def initiate_email_flow(payload: InitiateEmailFlowRequest):
+    """
+    Node-compatible email flow bootstrap endpoint.
+    """
+    result = initiate_google_email_flow(
+        google_access_token=payload.google_access_token,
+        sender_name=payload.sender_name,
+        recipient_email=payload.recipient_email,
+        recipient_name=payload.recipient_name,
+        context=payload.context or "Schedule a meeting.",
+    )
+    if not result.get("ok"):
+        status_code = int(result.get("status_code") or 500)
+        raise HTTPException(status_code=status_code, detail=result.get("error", "initiate_email_flow_failed"))
+
+    data = result.get("data", {})
+    return {"status": data.get("status", "ok"), "thread_id": data.get("thread_id"), "watch_ok": data.get("watch_ok", False)}
 
 
 # ── Local dev runner ─────────────────────────────────────────────────────────

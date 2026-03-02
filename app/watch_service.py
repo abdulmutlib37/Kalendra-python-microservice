@@ -12,16 +12,26 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from email.utils import parseaddr
 from typing import Any
 
 import httpx
 
+from app.agent_service import create_calendar_event, generate_scheduling_reply
 from app.logging_config import log_event
-from app.repository import update_watch_state
+from app.repository import (
+    create_thread,
+    delete_thread,
+    find_thread_by_gmail_thread,
+    mark_thread_message_processed,
+    save_thread,
+    update_watch_state,
+)
 from app.token_manager import TokenManager
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
 
 
 def _request_gmail(token: str, method: str, path: str, **kwargs) -> httpx.Response:
@@ -169,9 +179,251 @@ def _send_noted_reply(token: str, user_email: str, thread_id: str, message_id: s
     return True
 
 
+def _get_message_metadata(token: str, message_id: str) -> dict[str, str] | None:
+    resp = _request_gmail(
+        token,
+        "GET",
+        f"/messages/{message_id}",
+        params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Message-ID"]},
+    )
+    if resp.status_code != 200:
+        log_event("gmail_message_fetch_failed", message_id=message_id, status_code=resp.status_code)
+        return None
+    payload = resp.json().get("payload", {})
+    headers = {h.get("name", ""): h.get("value", "") for h in payload.get("headers", [])}
+    return {
+        "from": headers.get("From", ""),
+        "subject": headers.get("Subject", ""),
+        "message_id_header": headers.get("Message-ID", ""),
+    }
+
+
+def _get_thread_messages_for_agent(token: str, thread_id: str) -> list[str]:
+    resp = _request_gmail(token, "GET", f"/threads/{thread_id}", params={"format": "metadata", "metadataHeaders": ["From", "Subject"]})
+    if resp.status_code != 200:
+        log_event("gmail_thread_fetch_failed", thread_id=thread_id, status_code=resp.status_code)
+        return []
+    thread = resp.json()
+    messages = []
+    for m in thread.get("messages", []):
+        payload = m.get("payload", {})
+        headers = {h.get("name", ""): h.get("value", "") for h in payload.get("headers", [])}
+        sender = headers.get("From", "Unknown")
+        snippet = (m.get("snippet") or "").strip()
+        if snippet:
+            messages.append(f"From: {sender}\n{snippet}")
+    return messages
+
+
+def _send_agent_reply(
+    token: str,
+    user_email: str,
+    to_email: str,
+    subject: str,
+    body: str,
+    thread_id: str,
+    parent_message_id: str,
+) -> bool:
+    subj = subject.strip() or "Re:"
+    if not subj.lower().startswith("re:"):
+        subj = f"Re: {subj}"
+    raw_message = (
+        f"To: {to_email}\r\n"
+        f"Subject: {subj}\r\n"
+        f'Content-Type: text/plain; charset="UTF-8"\r\n'
+        f"In-Reply-To: {parent_message_id}\r\n"
+        f"References: {parent_message_id}\r\n"
+        "\r\n"
+        f"{body}"
+    )
+    raw_b64 = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
+    send_resp = _request_gmail(token, "POST", "/messages/send", json={"raw": raw_b64, "threadId": thread_id})
+    if send_resp.status_code not in (200, 202):
+        log_event(
+            "agent_reply_send_failed",
+            user_email=user_email,
+            status_code=send_resp.status_code,
+            response=send_resp.text[:500],
+        )
+        return False
+    log_event("email_sent", action="agent_reply", thread_id=thread_id, to=to_email)
+    return True
+
+
+def _send_initial_thread_email(
+    token: str,
+    to_email: str,
+    sender_name: str,
+    recipient_name: str,
+    context: str,
+) -> tuple[str | None, str | None]:
+    """
+    Send the first email in a scheduling flow and return (thread_id, message_id).
+    """
+    subject = f"Connecting with {recipient_name}"
+    body = (
+        f"Hi {recipient_name},\n\n"
+        "I hope you're doing well! Following our earlier conversation, I wanted to reach out "
+        "and find a time for us to connect properly.\n\n"
+        f"Context: {context}\n\n"
+        "Would you be open to a brief meeting sometime this week or next? "
+        "I'm flexible and happy to work around your schedule — just let me know what works best for you.\n\n"
+        "Looking forward to speaking with you!\n\n"
+        f"Warm regards,\n{sender_name}"
+    )
+
+    msg = MIMEText(body)
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+    send_resp = _request_gmail(token, "POST", "/messages/send", json={"raw": raw_b64})
+    if send_resp.status_code not in (200, 202):
+        log_event(
+            "gmail_initial_email_send_failed",
+            to=to_email,
+            status_code=send_resp.status_code,
+            response=send_resp.text[:500],
+        )
+        return None, None
+
+    data = send_resp.json() if send_resp.content else {}
+    thread_id = data.get("threadId")
+    message_id = data.get("id")
+    if not thread_id:
+        log_event("gmail_initial_email_thread_missing", to=to_email)
+        return None, None
+
+    log_event("email_sent", action="initiate_flow", thread_id=thread_id, to=to_email)
+    return thread_id, message_id
+
+
+def _ensure_watch_with_access_token(token: str, user_email: str) -> dict[str, Any]:
+    """
+    Ensure Gmail watch is active using the provided access token.
+    """
+    topic = os.getenv("GMAIL_PUBSUB_TOPIC")
+    if not topic:
+        return {"ok": False, "error": "GMAIL_PUBSUB_TOPIC is not configured"}
+
+    body: dict[str, Any] = {"topicName": topic}
+    label_ids = os.getenv("GMAIL_WATCH_LABEL_IDS")
+    if label_ids:
+        body["labelIds"] = [x.strip() for x in label_ids.split(",") if x.strip()]
+        body["labelFilterAction"] = "include"
+
+    resp = _request_gmail(token, "POST", "/watch", json=body)
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"watch_failed:{resp.status_code}", "response": resp.text[:500]}
+
+    payload = resp.json()
+    history_id = str(payload.get("historyId", ""))
+    expiration_ms = int(payload.get("expiration", "0"))
+    watch_expiration = datetime.fromtimestamp(expiration_ms / 1000, tz=timezone.utc) if expiration_ms else None
+    renew_at = (watch_expiration - timedelta(days=1)) if watch_expiration else None
+
+    save_data: dict[str, Any] = {"history_id": history_id}
+    if watch_expiration:
+        save_data["watch_expiration"] = watch_expiration
+    if renew_at:
+        save_data["expires_at"] = renew_at
+
+    save_res = update_watch_state(provider="google", user_email=user_email, data=save_data)
+    if not save_res.get("ok"):
+        return {"ok": False, "error": save_res.get("error", "watch_state_update_failed")}
+
+    return {
+        "ok": True,
+        "data": {
+            "history_id": history_id,
+            "watch_expiration": watch_expiration.isoformat() if watch_expiration else None,
+            "renew_at": renew_at.isoformat() if renew_at else None,
+        },
+    }
+
+
+def initiate_google_email_flow(
+    google_access_token: str,
+    sender_name: str,
+    recipient_email: str,
+    recipient_name: str,
+    context: str,
+) -> dict[str, Any]:
+    """
+    Start a Gmail scheduling thread, persist mapping in Firestore, and activate watch.
+    """
+    token = (google_access_token or "").strip()
+    if not token:
+        return {"ok": False, "error": "google_access_token is required", "status_code": 400}
+    if not recipient_email or not recipient_name or not sender_name:
+        return {"ok": False, "error": "sender_name, recipient_email, recipient_name are required", "status_code": 400}
+
+    profile_resp = _request_gmail(token, "GET", "/profile")
+    if profile_resp.status_code != 200:
+        return {"ok": False, "error": "failed_to_fetch_gmail_profile", "status_code": 401}
+    user_email = (profile_resp.json().get("emailAddress") or "").lower().strip()
+    if not user_email:
+        return {"ok": False, "error": "gmail_profile_missing_email", "status_code": 401}
+
+    thread_id, _message_id = _send_initial_thread_email(
+        token=token,
+        to_email=recipient_email,
+        sender_name=sender_name,
+        recipient_name=recipient_name,
+        context=context or "Schedule a meeting.",
+    )
+    if not thread_id:
+        return {"ok": False, "error": "failed_to_send_initial_email", "status_code": 502}
+
+    created = create_thread(
+        provider="google",
+        user_email=user_email,
+        data={
+            "gmail_thread_id": thread_id,
+            "status": "active",
+            "state": "open",
+            "turn_count": 0,
+            "context": context or "Schedule a meeting.",
+            "sender_name": sender_name,
+            "recipient_email": recipient_email.lower(),
+            "recipient_name": recipient_name,
+            "attendees": [recipient_email.lower()],
+            "source": "node_execute_initiate_email_flow",
+            "initiated_at": datetime.now(timezone.utc),
+        },
+    )
+    if not created.get("ok"):
+        return {"ok": False, "error": created.get("error", "thread_create_failed"), "status_code": 500}
+
+    watch_result = _ensure_watch_with_access_token(token=token, user_email=user_email)
+    if not watch_result.get("ok"):
+        log_event(
+            "gmail_watch_setup_warning",
+            user_email=user_email,
+            thread_id=thread_id,
+            error=watch_result.get("error"),
+        )
+
+    log_event(
+        "email_flow_initiated",
+        thread_id=thread_id,
+        user_email=user_email,
+        recipient_email=recipient_email.lower(),
+    )
+    return {
+        "ok": True,
+        "data": {
+            "status": "ok",
+            "thread_id": thread_id,
+            "watch_ok": bool(watch_result.get("ok")),
+            "watch_error": None if watch_result.get("ok") else watch_result.get("error"),
+        },
+    }
+
+
 def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager) -> dict[str, Any]:
     """
-    Process Gmail Pub/Sub push message and reply "Noted" on new messages.
+    Process Gmail Pub/Sub push and run agentic scheduling replies.
     """
     from app.repository import get_watch_state
 
@@ -219,20 +471,116 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
 
     history_items = history_resp.json().get("history", [])
     replied = 0
+    finalized = 0
     for item in history_items:
         for added in item.get("messagesAdded", []):
-            msg = added.get("message", {})
-            msg_id = msg.get("id")
-            thread_id = msg.get("threadId")
-            if not msg_id or not thread_id:
-                continue
+            try:
+                msg = added.get("message", {})
+                msg_id = msg.get("id")
+                thread_id = msg.get("threadId")
+                if not msg_id or not thread_id:
+                    continue
 
-            if _send_noted_reply(token, email_address, thread_id, msg_id):
+                meta = _get_message_metadata(token, msg_id)
+                if not meta:
+                    continue
+                from_email = parseaddr(meta["from"])[1].lower()
+                if not from_email or from_email == email_address.lower():
+                    continue
+
+                thread_lookup = find_thread_by_gmail_thread("google", email_address, thread_id)
+                if thread_lookup.get("ok"):
+                    thread_doc_id = thread_lookup["data"]["thread_doc_id"]
+                    thread_data = thread_lookup["data"]
+                else:
+                    created = create_thread(
+                        provider="google",
+                        user_email=email_address,
+                        data={
+                            "gmail_thread_id": thread_id,
+                            "status": "active",
+                            "state": "open",
+                            "turn_count": 0,
+                            "context": "Schedule a meeting via email.",
+                            "sender_name": "Scheduler Team",
+                            "attendees": [from_email],
+                        },
+                    )
+                    if not created.get("ok"):
+                        continue
+                    thread_doc_id = created["data"]["thread_doc_id"]
+                    thread_data = {
+                        "turn_count": 0,
+                        "context": "Schedule a meeting via email.",
+                        "sender_name": "Scheduler Team",
+                        "attendees": [from_email],
+                    }
+
+                # Atomic dedupe guard: one message ID should be processed once.
+                mark_res = mark_thread_message_processed(thread_doc_id, msg_id)
+                if not mark_res.get("ok"):
+                    continue
+                if mark_res["data"].get("already_processed"):
+                    continue
+
+                turn_count = int(thread_data.get("turn_count", 0))
+                if turn_count >= MAX_AGENT_TURNS:
+                    log_event("agent_max_turns_reached", thread_doc_id=thread_doc_id, turn_count=turn_count)
+                    continue
+
+                convo = _get_thread_messages_for_agent(token, thread_id)
+                if not convo:
+                    continue
+                reply_text, finalized_payload = generate_scheduling_reply(
+                    thread_messages=convo,
+                    google_access_token=token,
+                    sender_name=thread_data.get("sender_name", "Scheduler Team"),
+                    context=thread_data.get("context", "Schedule a meeting via email."),
+                )
+                if not reply_text:
+                    continue
+
+                sent = _send_agent_reply(
+                    token=token,
+                    user_email=email_address,
+                    to_email=from_email,
+                    subject=meta.get("subject", "Re:"),
+                    body=reply_text,
+                    thread_id=thread_id,
+                    parent_message_id=meta.get("message_id_header", ""),
+                )
+                if not sent:
+                    continue
+
                 replied += 1
+                save_thread(
+                    thread_doc_id,
+                    {
+                        "gmail_thread_id": thread_id,
+                        "status": "active",
+                        "state": "open",
+                        "turn_count": turn_count + 1,
+                        "last_message_id": msg_id,
+                        "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+                    },
+                )
+
+                if finalized_payload:
+                    create_result = create_calendar_event(token, finalized_payload)
+                    if create_result.get("ok"):
+                        delete_thread(thread_doc_id)
+                        finalized += 1
+                        log_event("thread_finalized", thread_doc_id=thread_doc_id)
+                    else:
+                        log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, error=create_result.get("error"))
+            except Exception as exc:
+                # Never fail whole webhook batch due to a single bad message.
+                log_event("gmail_push_message_process_failed", error=str(exc))
+                continue
 
     update_watch_state(
         provider="google",
         user_email=email_address,
         data={"history_id": new_history_id},
     )
-    return {"ok": True, "data": {"replied_count": replied}}
+    return {"ok": True, "data": {"replied_count": replied, "finalized_count": finalized}}
