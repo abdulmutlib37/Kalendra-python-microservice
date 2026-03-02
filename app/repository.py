@@ -32,6 +32,47 @@ def _watch_state_col():
     return get_db().document(ROOT_DOC).collection("watch_state")
 
 
+def _thread_index_col():
+    return get_db().document(ROOT_DOC).collection("thread_index")
+
+
+def _thread_lookup_doc_id(provider: str, user_email: str, gmail_thread_id: str) -> str:
+    return f"{provider.lower()}::{user_email.lower()}::{gmail_thread_id.strip()}"
+
+
+def _parse_thread_doc_id(doc_id: str) -> tuple[str, str] | None:
+    try:
+        parts = doc_id.split("::")
+        if len(parts) < 3:
+            return None
+        return parts[0].lower(), parts[1].lower()
+    except Exception:
+        return None
+
+
+def _upsert_thread_lookup(provider: str, user_email: str, gmail_thread_id: str, thread_doc_id: str) -> None:
+    if not gmail_thread_id:
+        return
+    lookup_id = _thread_lookup_doc_id(provider, user_email, gmail_thread_id)
+    _thread_index_col().document(lookup_id).set(
+        {
+            "provider": provider.lower(),
+            "user_email": user_email.lower(),
+            "gmail_thread_id": gmail_thread_id,
+            "thread_doc_id": thread_doc_id,
+            "updated_at": SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+
+def _delete_thread_lookup(provider: str, user_email: str, gmail_thread_id: str) -> None:
+    if not gmail_thread_id:
+        return
+    lookup_id = _thread_lookup_doc_id(provider, user_email, gmail_thread_id)
+    _thread_index_col().document(lookup_id).delete()
+
+
 def _next_thread_id(provider: str, user_email: str) -> str:
     """Atomically increment a counter to produce a unique thread ID."""
     db = get_db()
@@ -78,6 +119,19 @@ def save_thread(doc_id: str, data: dict) -> dict:
             "updated_at": SERVER_TIMESTAMP,
         }
         _threads_col().document(doc_id).set(doc, merge=True)
+
+        parsed = _parse_thread_doc_id(doc_id)
+        provider = (data.get("provider") or (parsed[0] if parsed else "")).lower()
+        user_email = (data.get("user_email") or (parsed[1] if parsed else "")).lower()
+        gmail_thread_id = str(data.get("gmail_thread_id", "")).strip()
+        if provider and user_email and gmail_thread_id:
+            _upsert_thread_lookup(
+                provider=provider,
+                user_email=user_email,
+                gmail_thread_id=gmail_thread_id,
+                thread_doc_id=doc_id,
+            )
+
         log_event("thread_saved", thread_doc_id=doc_id)
         return {"ok": True, "data": {"thread_doc_id": doc_id}}
     except Exception as e:
@@ -100,7 +154,25 @@ def get_thread(doc_id: str) -> dict:
 
 def delete_thread(doc_id: str) -> dict:
     try:
+        provider = ""
+        user_email = ""
+        gmail_thread_id = ""
+
+        parsed = _parse_thread_doc_id(doc_id)
+        if parsed:
+            provider, user_email = parsed
+
+        snap = _threads_col().document(doc_id).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            provider = (data.get("provider") or provider).lower()
+            user_email = (data.get("user_email") or user_email).lower()
+            gmail_thread_id = str(data.get("gmail_thread_id", "")).strip()
+
         _threads_col().document(doc_id).delete()
+        if provider and user_email and gmail_thread_id:
+            _delete_thread_lookup(provider, user_email, gmail_thread_id)
+
         log_event("thread_deleted", thread_doc_id=doc_id)
         return {"ok": True}
     except Exception as e:
@@ -121,15 +193,47 @@ def create_thread(provider: str, user_email: str, data: dict) -> dict:
 def find_thread_by_gmail_thread(provider: str, user_email: str, gmail_thread_id: str) -> dict:
     """
     Find the internal thread doc that maps to a Gmail thread id for a user.
-    Uses in-memory filtering to avoid Firestore composite-index requirements.
+    Uses indexed lookup first; falls back to scan and self-heals index.
     """
+    provider = provider.lower()
+    user_email = user_email.lower()
+    gmail_thread_id = str(gmail_thread_id).strip()
+
+    # Fast path: direct index lookup
+    try:
+        lookup_id = _thread_lookup_doc_id(provider, user_email, gmail_thread_id)
+        lookup_snap = _thread_index_col().document(lookup_id).get()
+        if lookup_snap.exists:
+            lookup_data = lookup_snap.to_dict() or {}
+            thread_doc_id = lookup_data.get("thread_doc_id")
+            if thread_doc_id:
+                thread_snap = _threads_col().document(thread_doc_id).get()
+                if thread_snap.exists:
+                    thread_data = thread_snap.to_dict() or {}
+                    return {"ok": True, "data": {"thread_doc_id": thread_doc_id, **thread_data}}
+    except Exception as e:
+        log_event(
+            "thread_lookup_index_read_failed",
+            provider=provider,
+            user_email=user_email,
+            gmail_thread_id=gmail_thread_id,
+            error=str(e),
+        )
+
+    # Slow fallback: scan user threads and heal index
     prefix = f"{provider.lower()}::{user_email.lower()}::"
     try:
         for doc in _threads_col().stream():
             if not doc.id.startswith(prefix):
                 continue
             data = doc.to_dict() or {}
-            if str(data.get("gmail_thread_id", "")).strip() == str(gmail_thread_id).strip():
+            if str(data.get("gmail_thread_id", "")).strip() == gmail_thread_id:
+                _upsert_thread_lookup(
+                    provider=provider,
+                    user_email=user_email,
+                    gmail_thread_id=gmail_thread_id,
+                    thread_doc_id=doc.id,
+                )
                 return {"ok": True, "data": {"thread_doc_id": doc.id, **data}}
         return {"ok": False, "error": "not_found"}
     except Exception as e:

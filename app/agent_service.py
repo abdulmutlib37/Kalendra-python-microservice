@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -55,44 +57,124 @@ def _openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def _get_calendar_events(google_access_token: str, time_min: str, time_max: str, max_results: int = 20) -> list[dict]:
-    headers = {"g-axs-tk": google_access_token}
+def _request_node_with_retries(
+    method: str,
+    path: str,
+    google_access_token: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    refresh_access_token: Callable[[], str | None] | None = None,
+    operation: str,
+    max_attempts: int = 4,
+) -> dict[str, Any]:
+    token = google_access_token
+    backoff_seconds = 1.0
+    refreshed_once = False
+
+    for attempt in range(1, max_attempts + 1):
+        headers = {"g-axs-tk": token}
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+
+        try:
+            resp = httpx.request(
+                method=method,
+                url=f"{NODE_BACKEND_URL}{path}",
+                headers=headers,
+                params=params,
+                json=json_body,
+                timeout=20.0,
+            )
+        except Exception as exc:
+            if attempt == max_attempts:
+                return {"ok": False, "error": f"{operation}_request_exception:{exc}"}
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 8.0)
+            continue
+
+        if resp.status_code == 200:
+            return {"ok": True, "response": resp, "token": token}
+
+        if resp.status_code == 401 and refresh_access_token and not refreshed_once:
+            refreshed_once = True
+            new_token = (refresh_access_token() or "").strip()
+            if new_token:
+                token = new_token
+                log_event(f"{operation}_token_refreshed_after_401", attempt=attempt)
+                continue
+            return {"ok": False, "error": f"{operation}_401_and_refresh_failed"}
+
+        if resp.status_code == 429 and attempt < max_attempts:
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 8.0)
+            continue
+
+        if resp.status_code >= 500 and attempt < max_attempts:
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 8.0)
+            continue
+
+        return {
+            "ok": False,
+            "error": f"{operation}_http_{resp.status_code}",
+            "response": resp.text[:500],
+        }
+
+    return {"ok": False, "error": f"{operation}_exhausted_retries"}
+
+
+def _get_calendar_events(
+    google_access_token: str,
+    time_min: str,
+    time_max: str,
+    max_results: int = 20,
+    refresh_access_token: Callable[[], str | None] | None = None,
+) -> list[dict]:
     params = {
         "timeMin": time_min,
         "timeMax": time_max,
         "maxResults": max_results,
         "type": "google",
     }
-    url = f"{NODE_BACKEND_URL}/api/calendar/events"
-    try:
-        resp = httpx.get(url, headers=headers, params=params, timeout=20.0)
-        if resp.status_code != 200:
-            log_event(
-                "agent_calendar_fetch_failed",
-                status_code=resp.status_code,
-                response=resp.text[:500],
-            )
-            return []
-        payload = resp.json()
-        events = payload.get("events", []) if isinstance(payload, dict) else []
-        slim = []
-        for e in events:
-            slim.append(
-                {
-                    "summary": e.get("summary", "Busy"),
-                    "start": (e.get("start") or {}).get("dateTime"),
-                    "end": (e.get("end") or {}).get("dateTime"),
-                }
-            )
-        return slim
-    except Exception as exc:
-        log_event("agent_calendar_fetch_exception", error=str(exc))
+    result = _request_node_with_retries(
+        method="GET",
+        path="/api/calendar/events",
+        google_access_token=google_access_token,
+        params=params,
+        refresh_access_token=refresh_access_token,
+        operation="agent_calendar_fetch",
+    )
+    if not result.get("ok"):
+        log_event(
+            "agent_calendar_fetch_failed",
+            error=result.get("error"),
+            response=result.get("response"),
+        )
         return []
 
+    payload = result["response"].json()
+    events = payload.get("events", []) if isinstance(payload, dict) else []
+    log_event("agent_calendar_fetch_success", event_count=len(events))
+    slim = []
+    for e in events:
+        start_obj = e.get("start") or {}
+        end_obj = e.get("end") or {}
+        slim.append(
+            {
+                "summary": e.get("summary", "Busy"),
+                "start": start_obj.get("dateTime") or start_obj.get("date"),
+                "end": end_obj.get("dateTime") or end_obj.get("date"),
+            }
+        )
+    return slim
 
-def create_calendar_event(google_access_token: str, event_data: dict[str, Any]) -> dict[str, Any]:
-    headers = {"g-axs-tk": google_access_token, "Content-Type": "application/json"}
-    url = f"{NODE_BACKEND_URL}/api/calendar/events"
+
+def create_calendar_event(
+    google_access_token: str,
+    event_data: dict[str, Any],
+    refresh_access_token: Callable[[], str | None] | None = None,
+) -> dict[str, Any]:
     body = {
         "summary": event_data.get("summary", "Meeting"),
         "startTime": event_data.get("startTime"),
@@ -101,13 +183,24 @@ def create_calendar_event(google_access_token: str, event_data: dict[str, Any]) 
         "attendees": event_data.get("attendees", []),
         "type": "google",
     }
-    try:
-        resp = httpx.post(url, headers=headers, json=body, timeout=20.0)
-        if resp.status_code != 200:
-            return {"ok": False, "error": f"create_event_http_{resp.status_code}", "response": resp.text[:500]}
-        return {"ok": True, "data": resp.json()}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+    result = _request_node_with_retries(
+        method="POST",
+        path="/api/calendar/events",
+        google_access_token=google_access_token,
+        json_body=body,
+        refresh_access_token=refresh_access_token,
+        operation="agent_create_event",
+    )
+    if not result.get("ok"):
+        log_event(
+            "agent_create_event_failed",
+            error=result.get("error"),
+            response=result.get("response"),
+        )
+        return {"ok": False, "error": result.get("error"), "response": result.get("response")}
+    created_payload = result["response"].json()
+    log_event("agent_create_event_success")
+    return {"ok": True, "data": created_payload}
 
 
 def _extract_finalized(content: str) -> tuple[str, dict[str, Any] | None]:
@@ -127,6 +220,7 @@ def generate_scheduling_reply(
     google_access_token: str,
     sender_name: str = "Scheduler Team",
     context: str = "Schedule a meeting professionally.",
+    refresh_access_token: Callable[[], str | None] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     client = _openai_client()
     user_prompt = (
@@ -165,6 +259,7 @@ def generate_scheduling_reply(
                 time_min=args.get("timeMin", ""),
                 time_max=args.get("timeMax", ""),
                 max_results=int(args.get("maxResults", 20)),
+                refresh_access_token=refresh_access_token,
             )
             messages.append(
                 {

@@ -34,6 +34,7 @@ from app.watch_service import (
     initiate_google_email_flow,
     process_gmail_push,
     renew_gmail_watch,
+    verify_pubsub_auth_header,
 )
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ class InitiateEmailFlowRequest(BaseModel):
     google_access_token: str
     sender_name: str
     recipient_email: str
-    recipient_name: str
+    recipient_name: str | None = None
     context: str | None = None
 
 
@@ -288,11 +289,22 @@ async def renew_watches():
 
 
 @app.post("/gmail/push")
-async def gmail_push(payload: dict):
+async def gmail_push(payload: dict, request: Request):
     """
     Gmail Pub/Sub push webhook.
-    For testing behavior, replies in-thread with "Noted" on new messages.
+    Processes scheduling replies from Gmail thread updates.
     """
+    require_pubsub_auth = os.getenv("REQUIRE_PUBSUB_AUTH", "false").lower() == "true"
+    if require_pubsub_auth:
+        expected_audience = os.getenv("PUBSUB_PUSH_AUDIENCE") or str(request.url)
+        verify = verify_pubsub_auth_header(
+            auth_header=request.headers.get("Authorization"),
+            expected_audience=expected_audience,
+        )
+        if not verify.get("ok"):
+            log_event("gmail_push_auth_failed", error=verify.get("error"))
+            raise HTTPException(status_code=401, detail="Unauthorized Pub/Sub push")
+
     result = process_gmail_push(push_payload=payload, token_manager=token_manager)
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error")}
@@ -309,7 +321,8 @@ async def initiate_email_flow(payload: InitiateEmailFlowRequest):
         sender_name=payload.sender_name,
         recipient_email=payload.recipient_email,
         recipient_name=payload.recipient_name,
-        context=payload.context or "Schedule a meeting.",
+        context=payload.context or "",
+        token_manager=token_manager,
     )
     if not result.get("ok"):
         status_code = int(result.get("status_code") or 500)

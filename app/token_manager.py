@@ -33,6 +33,13 @@ class TokenManager:
     def _threads_col(self):
         return self.db.document(ROOT_DOC).collection("threads")
 
+    def _watch_state_doc(self, user_email: str, provider: str):
+        return (
+            self.db.document(ROOT_DOC)
+            .collection("watch_state")
+            .document(f"{provider.lower()}::{user_email.lower()}")
+        )
+
     def _matching_threads(self, user_email: str, provider: str):
         return (
             self._threads_col()
@@ -63,6 +70,28 @@ class TokenManager:
             if data.get("refresh_token_encrypted"):
                 return doc
         return None
+
+    def _token_owner_thread_doc(self, user_email: str, provider: str):
+        try:
+            ws = self._watch_state_doc(user_email, provider).get()
+            if not ws.exists:
+                return None
+            data = ws.to_dict() or {}
+            owner_id = str(data.get("token_owner_thread_id", "")).strip()
+            if not owner_id:
+                return None
+            snap = self._threads_col().document(owner_id).get()
+            if not snap.exists:
+                return None
+            return snap
+        except Exception:
+            return None
+
+    def _set_token_owner_thread_id(self, user_email: str, provider: str, thread_doc_id: str) -> None:
+        self._watch_state_doc(user_email, provider).set(
+            {"token_owner_thread_id": thread_doc_id, "updated_at": SERVER_TIMESTAMP},
+            merge=True,
+        )
 
     def _get_fernet_key(self) -> str:
         key = os.getenv("FERNET_KEY") or os.getenv("TOKEN_ENCRYPTION_KEY")
@@ -163,6 +192,9 @@ class TokenManager:
             else:
                 target_id = target.id
 
+            # Deterministic token owner for scalable refresh/read behavior.
+            self._set_token_owner_thread_id(user_email, provider, target_id)
+
             self._threads_col().document(target_id).set(doc, merge=True)
             log_event("token_stored", provider=provider, user_email=user_email.lower())
             return True
@@ -179,7 +211,11 @@ class TokenManager:
         provider = provider.lower()
 
         try:
-            snap = self._latest_thread_with_tokens(user_email, provider)
+            snap = self._token_owner_thread_doc(user_email, provider)
+            if snap is None:
+                snap = self._latest_thread_with_tokens(user_email, provider)
+                if snap is not None:
+                    self._set_token_owner_thread_id(user_email, provider, snap.id)
             if snap is None:
                 log_event("token_not_found", provider=provider, user_email=user_email.lower())
                 return None
