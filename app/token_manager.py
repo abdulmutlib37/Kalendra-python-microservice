@@ -207,6 +207,21 @@ class TokenManager:
             )
             return False
 
+    def get_existing_refresh_token(self, user_email: str, provider: str) -> Optional[str]:
+        """Return stored refresh token if any. Used to avoid overwriting real refresh with access-token mirror."""
+        provider = provider.lower()
+        try:
+            snap = self._token_owner_thread_doc(user_email, provider)
+            if snap is None:
+                snap = self._latest_thread_with_tokens(user_email, provider)
+            if snap is None:
+                return None
+            data = snap.to_dict() or {}
+            rt = self._decrypt(data.get("refresh_token_encrypted", ""))
+            return (rt or "").strip() or None
+        except Exception:
+            return None
+
     def get_fresh_token(self, user_email: str, provider: str) -> Optional[str]:
         provider = provider.lower()
 
@@ -312,6 +327,15 @@ class TokenManager:
             log_event("google_refresh_config_missing")
             return None
 
+        # In initiate-email-flow we may temporarily mirror access_token into
+        # refresh_token when no true refresh token is available. Google access
+        # tokens (commonly "ya29...") cannot be used for refresh and will always
+        # return invalid_grant. Skip endpoint calls in that case to avoid noisy
+        # repeated refresh failures.
+        if refresh_token.startswith("ya29."):
+            log_event("google_refresh_skipped_non_refresh_token")
+            return None
+
         # First try Google's native credential refresh flow.
         try:
             creds = Credentials(
@@ -367,24 +391,47 @@ class TokenManager:
             log_event("outlook_refresh_config_missing")
             return None
 
-        url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": scope,
-        }
-        try:
-            response = httpx.post(url, data=data, timeout=15.0)
-            if response.status_code != 200:
+        # Microsoft refresh can fail for some combinations of tenant/scope/client_secret.
+        # Try a few safe variants before giving up.
+        attempts: list[tuple[str, dict]] = []
+        tenant_candidates = [tenant]
+        if tenant.lower() != "common":
+            tenant_candidates.append("common")
+
+        for t in tenant_candidates:
+            base = {
+                "client_id": client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+            attempts.append((t, {**base, "client_secret": client_secret, "scope": scope}))
+            attempts.append((t, {**base, "client_secret": client_secret}))
+            attempts.append((t, {**base, "scope": scope}))
+            attempts.append((t, base))
+
+        last_error: str | None = None
+        for t, data in attempts:
+            url = f"https://login.microsoftonline.com/{t}/oauth2/v2.0/token"
+            try:
+                response = httpx.post(url, data=data, timeout=15.0)
+                if response.status_code == 200:
+                    return response.json()
+                last_error = response.text[:500]
                 log_event(
                     "outlook_refresh_http_error",
                     status_code=response.status_code,
-                    response=response.text[:500],
+                    response=last_error,
+                    tenant=t,
+                    with_scope="scope" in data,
+                    with_secret="client_secret" in data,
                 )
-                return None
-            return response.json()
-        except Exception as exc:
-            log_event("outlook_refresh_exception", error=str(exc))
-            return None
+            except Exception as exc:
+                last_error = str(exc)
+                log_event(
+                    "outlook_refresh_exception",
+                    error=last_error,
+                    tenant=t,
+                    with_scope="scope" in data,
+                    with_secret="client_secret" in data,
+                )
+        return None

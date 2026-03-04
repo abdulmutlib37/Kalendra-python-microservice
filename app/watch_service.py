@@ -1,5 +1,5 @@
 """
-Google watch renewal + push processing (Google-only).
+Google/Outlook watch renewal + push processing.
 
 Uses the restructured Firestore layout under a2h-emailing/config:
   - watch_state subcollection (doc ID = provider::userEmail)
@@ -26,6 +26,8 @@ from app.logging_config import log_event
 from app.repository import (
     create_thread,
     delete_thread,
+    find_recent_active_thread_by_recipient,
+    find_single_active_thread_for_user,
     find_thread_by_gmail_thread,
     mark_thread_message_processed,
     save_thread,
@@ -34,6 +36,7 @@ from app.repository import (
 from app.token_manager import TokenManager
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+OUTLOOK_API_BASE = "https://graph.microsoft.com/v1.0"
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
 
 
@@ -86,6 +89,19 @@ def _request_gmail(token: str, method: str, path: str, **kwargs) -> httpx.Respon
     return httpx.request(
         method=method,
         url=f"{GMAIL_API_BASE}{path}",
+        headers=headers,
+        timeout=20.0,
+        **kwargs,
+    )
+
+
+def _request_outlook(token: str, method: str, path: str, **kwargs) -> httpx.Response:
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Content-Type"] = "application/json"
+    return httpx.request(
+        method=method,
+        url=f"{OUTLOOK_API_BASE}{path}",
         headers=headers,
         timeout=20.0,
         **kwargs,
@@ -171,6 +187,42 @@ def renew_gmail_watch(user_email: str, token_manager: TokenManager) -> dict[str,
         renew_at=renew_at.isoformat(),
     )
     return {"ok": True, "data": {"user_email": user_email, "history_id": history_id}}
+
+
+def renew_outlook_watch(user_email: str, token_manager: TokenManager) -> dict[str, Any]:
+    from app.repository import get_watch_state
+
+    token = token_manager.get_fresh_token(user_email=user_email, provider="outlook")
+    if not token:
+        return {"ok": False, "error": "No valid Outlook token"}
+
+    watch_result = get_watch_state(provider="outlook", user_email=user_email)
+    state = watch_result.get("data") if watch_result.get("ok") else {}
+    subscription_id = str((state or {}).get("subscription_id", "")).strip()
+    if not subscription_id:
+        return _ensure_outlook_subscription_with_access_token(token=token, user_email=user_email)
+
+    expires = (datetime.now(timezone.utc) + timedelta(days=2)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    patch_resp = _request_outlook(
+        token,
+        "PATCH",
+        f"/subscriptions/{subscription_id}",
+        json={"expirationDateTime": expires},
+    )
+    if patch_resp.status_code == 404:
+        return _ensure_outlook_subscription_with_access_token(token=token, user_email=user_email)
+    if patch_resp.status_code not in (200, 202):
+        return {"ok": False, "error": f"outlook_subscription_renew_failed:{patch_resp.status_code}"}
+
+    update_watch_state(
+        provider="outlook",
+        user_email=user_email,
+        data={
+            "watch_expiration": datetime.fromisoformat(expires.replace("Z", "+00:00")),
+            "expires_at": datetime.fromisoformat(expires.replace("Z", "+00:00")) - timedelta(hours=6),
+        },
+    )
+    return {"ok": True, "data": {"user_email": user_email, "subscription_id": subscription_id}}
 
 
 def _extract_notification_data(push_payload: dict[str, Any]) -> dict[str, str] | None:
@@ -277,6 +329,27 @@ def _get_thread_messages_for_agent(token: str, thread_id: str) -> list[str]:
         if snippet:
             messages.append(f"From: {sender}\n{snippet}")
     return messages
+
+
+def _is_finalization_confident(thread_messages: list[str]) -> bool:
+    """
+    Prevent premature closure when the model emits FINALIZED too early.
+    We require explicit acceptance language plus a concrete time/day signal
+    in the latest inbound content.
+    """
+    if not thread_messages:
+        return False
+    latest = (thread_messages[-1] or "").lower()
+    has_acceptance = bool(
+        re.search(r"\b(yes|confirmed|confirm|works for me|that works|sounds good|see you|agreed|perfect)\b", latest)
+    )
+    has_time_signal = bool(
+        re.search(
+            r"\b(\d{1,2}(:\d{2})?\s?(am|pm)|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|utc|gmt)\b",
+            latest,
+        )
+    )
+    return has_acceptance and has_time_signal
 
 
 def _send_agent_reply(
@@ -445,16 +518,21 @@ def initiate_google_email_flow(
     if not user_email:
         return {"ok": False, "error": "gmail_profile_missing_email", "status_code": 401}
 
-    # Store token for immediate follow-up processing. In this flow we only receive
-    # an access token, so we mirror it into refresh_token as a short-term fallback.
-    # This keeps back-and-forth working like email-poc for active sessions.
+    # Store token for immediate follow-up. Prefer existing real refresh token (from
+    # onboarding) so tokens don't expire daily. Only mirror access_token as fallback.
     if token_manager is not None:
         try:
+            existing_refresh = token_manager.get_existing_refresh_token(user_email, "google")
+            refresh_to_store = (
+                existing_refresh
+                if existing_refresh and not existing_refresh.strip().startswith("ya29.")
+                else token
+            )
             stored = token_manager.store_tokens(
                 user_email=user_email,
                 provider="google",
                 access_token=token,
-                refresh_token=token,
+                refresh_token=refresh_to_store,
                 expires_in_seconds=3300,
             )
             if not stored:
@@ -525,6 +603,349 @@ def initiate_google_email_flow(
             "watch_error": None if watch_result.get("ok") else watch_result.get("error"),
         },
     }
+
+
+def _send_initial_outlook_thread_email(
+    token: str,
+    to_email: str,
+    sender_name: str,
+    recipient_name: str | None,
+    context: str,
+) -> dict[str, Any]:
+    context_text = (context or "").strip()
+    subject = _extract_subject_from_context(context_text)
+    detail_line = _extract_human_detail_from_context(context_text)
+
+    greeting_name = (recipient_name or "").strip()
+    salutation = f"Hi {greeting_name}," if greeting_name else "Hi,"
+
+    body_lines = [
+        salutation,
+        "",
+        "I would like to schedule a meeting with you.",
+    ]
+    if detail_line:
+        body_lines.extend(["", detail_line])
+    body_lines.extend(
+        [
+            "",
+            "Please share a suitable time.",
+            "",
+            "Regards,",
+            sender_name,
+            "",
+            "Email Scheduling - Powered by Kalendra",
+        ]
+    )
+    body = "\n".join(body_lines)
+
+    draft_resp = _request_outlook(
+        token,
+        "POST",
+        "/me/messages",
+        json={
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": to_email}}],
+        },
+    )
+    if draft_resp.status_code not in (200, 201):
+        err_text = draft_resp.text[:1000]
+        try:
+            payload = draft_resp.json()
+            graph_msg = (
+                payload.get("error", {}).get("message")
+                if isinstance(payload, dict)
+                else None
+            )
+            if graph_msg:
+                err_text = str(graph_msg)
+        except Exception:
+            pass
+        log_event(
+            "outlook_initial_email_draft_failed",
+            to=to_email,
+            status_code=draft_resp.status_code,
+            response=err_text[:500],
+        )
+        return {
+            "ok": False,
+            "status_code": draft_resp.status_code,
+            "error": f"outlook_message_create_failed:{err_text}",
+        }
+
+    draft = draft_resp.json()
+    message_id = draft.get("id")
+    conversation_id = draft.get("conversationId")
+    if not message_id:
+        return {"ok": False, "status_code": 502, "error": "outlook_message_create_missing_id"}
+
+    send_resp = _request_outlook(token, "POST", f"/me/messages/{message_id}/send")
+    if send_resp.status_code not in (200, 202):
+        err_text = send_resp.text[:1000]
+        try:
+            payload = send_resp.json()
+            graph_msg = (
+                payload.get("error", {}).get("message")
+                if isinstance(payload, dict)
+                else None
+            )
+            if graph_msg:
+                err_text = str(graph_msg)
+        except Exception:
+            pass
+        log_event(
+            "outlook_initial_email_send_failed",
+            to=to_email,
+            status_code=send_resp.status_code,
+            response=err_text[:500],
+        )
+        return {
+            "ok": False,
+            "status_code": send_resp.status_code,
+            "error": f"outlook_message_send_failed:{err_text}",
+        }
+
+    thread_id = conversation_id or message_id
+    log_event("email_sent", action="initiate_flow_outlook", thread_id=thread_id, to=to_email)
+    return {"ok": True, "thread_id": thread_id, "message_id": message_id}
+
+
+def _ensure_outlook_subscription_with_access_token(token: str, user_email: str) -> dict[str, Any]:
+    webhook_url = (os.getenv("OUTLOOK_WEBHOOK_URL") or "").strip()
+    if not webhook_url:
+        return {"ok": False, "error": "OUTLOOK_WEBHOOK_URL is not configured"}
+
+    expires = (datetime.now(timezone.utc) + timedelta(days=2)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    body = {
+        "changeType": "created",
+        "notificationUrl": webhook_url,
+        "resource": "/me/messages",
+        "expirationDateTime": expires,
+        "clientState": f"kalendra::{user_email.lower()}",
+    }
+    resp = _request_outlook(token, "POST", "/subscriptions", json=body)
+    if resp.status_code not in (200, 201):
+        return {"ok": False, "error": f"subscription_failed:{resp.status_code}", "response": resp.text[:500]}
+
+    payload = resp.json()
+    subscription_id = payload.get("id")
+    expiration = payload.get("expirationDateTime")
+    expires_at = None
+    if expiration:
+        try:
+            expires_at = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+        except Exception:
+            expires_at = None
+
+    save_data: dict[str, Any] = {"subscription_id": subscription_id}
+    if expires_at:
+        save_data["watch_expiration"] = expires_at
+        save_data["expires_at"] = expires_at - timedelta(hours=6)
+    update_watch_state(provider="outlook", user_email=user_email, data=save_data)
+    return {"ok": True, "data": {"subscription_id": subscription_id, "watch_expiration": expiration}}
+
+
+def initiate_outlook_email_flow(
+    outlook_access_token: str,
+    sender_name: str,
+    recipient_email: str,
+    recipient_name: str | None,
+    context: str,
+    token_manager: TokenManager | None = None,
+) -> dict[str, Any]:
+    token = (outlook_access_token or "").strip()
+    if not token:
+        return {"ok": False, "error": "outlook_access_token is required", "status_code": 400}
+    if not recipient_email or not sender_name:
+        return {"ok": False, "error": "sender_name and recipient_email are required", "status_code": 400}
+
+    profile_resp = _request_outlook(token, "GET", "/me?$select=mail,userPrincipalName")
+    if profile_resp.status_code != 200:
+        return {"ok": False, "error": "failed_to_fetch_outlook_profile", "status_code": 401}
+    p = profile_resp.json()
+    user_email = (p.get("mail") or p.get("userPrincipalName") or "").lower().strip()
+    if not user_email:
+        return {"ok": False, "error": "outlook_profile_missing_email", "status_code": 401}
+
+    if token_manager is not None:
+        # Preserve existing real refresh token if available.
+        # Do not overwrite it with short-lived access token on each initiate call.
+        existing_refresh = token_manager.get_existing_refresh_token(user_email, "outlook")
+        refresh_to_store = existing_refresh or token
+        token_manager.store_tokens(
+            user_email=user_email,
+            provider="outlook",
+            access_token=token,
+            refresh_token=refresh_to_store,
+            expires_in_seconds=3300,
+        )
+
+    send_result = _send_initial_outlook_thread_email(
+        token=token,
+        to_email=recipient_email,
+        sender_name=sender_name,
+        recipient_name=recipient_name,
+        context=context or "",
+    )
+    if not send_result.get("ok"):
+        return {
+            "ok": False,
+            "error": send_result.get("error", "failed_to_send_initial_outlook_email"),
+            "status_code": int(send_result.get("status_code") or 502),
+        }
+    thread_id = str(send_result.get("thread_id") or "").strip()
+    if not thread_id:
+        return {"ok": False, "error": "failed_to_resolve_outlook_thread_id", "status_code": 502}
+
+    created = create_thread(
+        provider="outlook",
+        user_email=user_email,
+        data={
+            "gmail_thread_id": thread_id,
+            "status": "active",
+            "state": "open",
+            "turn_count": 0,
+            "context": context or "",
+            "sender_name": sender_name,
+            "recipient_email": recipient_email.lower(),
+            "recipient_name": (recipient_name or "").strip(),
+            "attendees": [recipient_email.lower()],
+            "source": "node_execute_initiate_email_flow",
+            "initiated_at": datetime.now(timezone.utc),
+        },
+    )
+    if not created.get("ok"):
+        return {"ok": False, "error": created.get("error", "thread_create_failed"), "status_code": 500}
+
+    watch_result = _ensure_outlook_subscription_with_access_token(token=token, user_email=user_email)
+    if not watch_result.get("ok"):
+        return {
+            "ok": False,
+            "error": watch_result.get("error", "outlook_watch_setup_failed"),
+            "status_code": 502,
+        }
+    return {
+        "ok": True,
+        "data": {
+            "status": "ok",
+            "thread_id": thread_id,
+            "watch_ok": bool(watch_result.get("ok")),
+            "watch_error": None if watch_result.get("ok") else watch_result.get("error"),
+        },
+    }
+
+
+def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManager) -> dict[str, Any]:
+    notifications = push_payload.get("value") or []
+    replied = 0
+    finalized = 0
+    for n in notifications:
+        client_state = str(n.get("clientState", ""))
+        if not client_state.startswith("kalendra::"):
+            continue
+        user_email = client_state.split("::", 1)[1].strip().lower()
+        if not user_email:
+            continue
+
+        resource_data = n.get("resourceData") or {}
+        message_id = resource_data.get("id")
+        if not message_id:
+            resource = str(n.get("resource", ""))
+            if "/messages/" in resource:
+                message_id = resource.rsplit("/messages/", 1)[-1].split("?")[0]
+        if not message_id:
+            continue
+
+        token = token_manager.get_fresh_token(user_email, "outlook")
+        if not token:
+            continue
+
+        msg_resp = _request_outlook(
+            token,
+            "GET",
+            f"/me/messages/{message_id}?$select=id,conversationId,subject,from,bodyPreview,internetMessageId",
+        )
+        if msg_resp.status_code != 200:
+            continue
+        msg = msg_resp.json()
+        thread_id = msg.get("conversationId") or msg.get("id")
+        from_email = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+        if not from_email or from_email == user_email:
+            continue
+
+        lookup = find_thread_by_gmail_thread("outlook", user_email, thread_id)
+        if not lookup.get("ok"):
+            continue
+        thread_doc_id = lookup["data"]["thread_doc_id"]
+        thread_data = lookup["data"]
+
+        mark_res = mark_thread_message_processed(thread_doc_id, message_id)
+        if not mark_res.get("ok") or mark_res["data"].get("already_processed"):
+            continue
+
+        turn_count = int(thread_data.get("turn_count", 0))
+        if turn_count >= MAX_AGENT_TURNS:
+            continue
+
+        # Avoid brittle Graph conversation filters by keeping a lightweight
+        # per-thread transcript in Firestore for Outlook threads.
+        snippet = (msg.get("bodyPreview") or "").strip()
+        convo = list(thread_data.get("conversation_messages") or [])
+        if snippet:
+            convo.append(f"From: {from_email}\n{snippet}")
+        # Keep context bounded for token/cost safety.
+        convo = convo[-30:]
+        if not convo:
+            continue
+
+        reply_text, finalized_payload = generate_scheduling_reply(
+            thread_messages=convo,
+            access_token=token,
+            provider="outlook",
+            sender_name=thread_data.get("sender_name", "Scheduler Team"),
+            context=thread_data.get("context", "Schedule a meeting via email."),
+            refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+        )
+        if not reply_text:
+            continue
+
+        reply_resp = _request_outlook(token, "POST", f"/me/messages/{message_id}/reply", json={"comment": reply_text})
+        if reply_resp.status_code not in (200, 202):
+            continue
+        replied += 1
+
+        save_thread(
+            thread_doc_id,
+            {
+                "gmail_thread_id": thread_id,
+                "status": "active",
+                "state": "open",
+                "turn_count": turn_count + 1,
+                "last_message_id": message_id,
+                "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+                "conversation_messages": (convo + [f"From: {user_email}\n{reply_text}"])[-30:],
+            },
+        )
+
+        if finalized_payload:
+            if _is_finalization_confident(convo):
+                create_result = create_calendar_event(
+                    token,
+                    finalized_payload,
+                    provider="outlook",
+                    refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+                )
+                if create_result.get("ok"):
+                    delete_thread(thread_doc_id)
+                    finalized += 1
+                    log_event("thread_finalized", thread_doc_id=thread_doc_id, provider="outlook")
+                else:
+                    log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, provider="outlook", error=create_result.get("error"))
+            else:
+                log_event("thread_finalize_skipped_low_confidence", thread_doc_id=thread_doc_id, provider="outlook")
+
+    return {"ok": True, "data": {"replied_count": replied, "finalized_count": finalized}}
 
 
 def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager) -> dict[str, Any]:
@@ -599,25 +1020,76 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if not msg_id or not thread_id:
                     continue
 
-                # Fast reject: only process threads explicitly tracked in Firestore.
-                thread_lookup = find_thread_by_gmail_thread("google", email_address, thread_id)
-                if thread_lookup.get("ok"):
-                    thread_doc_id = thread_lookup["data"]["thread_doc_id"]
-                    thread_data = thread_lookup["data"]
-                else:
-                    log_event(
-                        "gmail_push_untracked_thread_ignored",
-                        user_email=email_address,
-                        gmail_thread_id=thread_id,
-                    )
-                    continue
-
                 meta = _get_message_metadata(token, msg_id)
                 if not meta:
                     continue
                 from_email = parseaddr(meta["from"])[1].lower()
                 if not from_email or from_email == email_address.lower():
                     continue
+
+                # Fast reject: only process threads explicitly tracked in Firestore.
+                thread_lookup = find_thread_by_gmail_thread("google", email_address, thread_id)
+                if thread_lookup.get("ok"):
+                    thread_doc_id = thread_lookup["data"]["thread_doc_id"]
+                    thread_data = thread_lookup["data"]
+                else:
+                    # Recovery path: if exactly one active thread exists for this
+                    # recipient, rebind it to the new Gmail thread id and continue.
+                    recovered = find_recent_active_thread_by_recipient(
+                        provider="google",
+                        user_email=email_address,
+                        recipient_email=from_email,
+                    )
+                    if recovered.get("ok"):
+                        thread_doc_id = recovered["data"]["thread_doc_id"]
+                        thread_data = recovered["data"]
+                        save_thread(
+                            thread_doc_id,
+                            {
+                                "provider": "google",
+                                "user_email": email_address.lower(),
+                                "gmail_thread_id": thread_id,
+                            },
+                        )
+                        log_event(
+                            "gmail_push_thread_recovered_by_recipient",
+                            user_email=email_address,
+                            gmail_thread_id=thread_id,
+                            thread_doc_id=thread_doc_id,
+                            from_email=from_email,
+                        )
+                    else:
+                        recovered_single = find_single_active_thread_for_user(
+                            provider="google",
+                            user_email=email_address,
+                        )
+                        if recovered_single.get("ok"):
+                            thread_doc_id = recovered_single["data"]["thread_doc_id"]
+                            thread_data = recovered_single["data"]
+                            save_thread(
+                                thread_doc_id,
+                                {
+                                    "provider": "google",
+                                    "user_email": email_address.lower(),
+                                    "gmail_thread_id": thread_id,
+                                },
+                            )
+                            log_event(
+                                "gmail_push_thread_recovered_single_active",
+                                user_email=email_address,
+                                gmail_thread_id=thread_id,
+                                thread_doc_id=thread_doc_id,
+                                from_email=from_email,
+                            )
+                        else:
+                            log_event(
+                                "gmail_push_untracked_thread_ignored",
+                                user_email=email_address,
+                                gmail_thread_id=thread_id,
+                                from_email=from_email,
+                                subject=meta.get("subject", ""),
+                            )
+                            continue
 
                 # Atomic dedupe guard: one message ID should be processed once.
                 mark_res = mark_thread_message_processed(thread_doc_id, msg_id)
@@ -636,7 +1108,8 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     continue
                 reply_text, finalized_payload = generate_scheduling_reply(
                     thread_messages=convo,
-                    google_access_token=token,
+                    access_token=token,
+                    provider="google",
                     sender_name=thread_data.get("sender_name", "Scheduler Team"),
                     context=thread_data.get("context", "Schedule a meeting via email."),
                     refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
@@ -670,17 +1143,21 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 )
 
                 if finalized_payload:
-                    create_result = create_calendar_event(
-                        token,
-                        finalized_payload,
-                        refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
-                    )
-                    if create_result.get("ok"):
-                        delete_thread(thread_doc_id)
-                        finalized += 1
-                        log_event("thread_finalized", thread_doc_id=thread_doc_id)
+                    if _is_finalization_confident(convo):
+                        create_result = create_calendar_event(
+                            token,
+                            finalized_payload,
+                            provider="google",
+                            refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                        )
+                        if create_result.get("ok"):
+                            delete_thread(thread_doc_id)
+                            finalized += 1
+                            log_event("thread_finalized", thread_doc_id=thread_doc_id)
+                        else:
+                            log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, error=create_result.get("error"))
                     else:
-                        log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, error=create_result.get("error"))
+                        log_event("thread_finalize_skipped_low_confidence", thread_doc_id=thread_doc_id)
                 processed_items += 1
             except Exception as exc:
                 # Never fail whole webhook batch due to a single bad message.

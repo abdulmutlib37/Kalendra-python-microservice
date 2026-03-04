@@ -60,7 +60,8 @@ def _openai_client() -> OpenAI:
 def _request_node_with_retries(
     method: str,
     path: str,
-    google_access_token: str,
+    access_token: str,
+    provider: str = "google",
     *,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
@@ -68,12 +69,13 @@ def _request_node_with_retries(
     operation: str,
     max_attempts: int = 4,
 ) -> dict[str, Any]:
-    token = google_access_token
+    provider = (provider or "google").lower()
+    token = access_token
     backoff_seconds = 1.0
     refreshed_once = False
 
     for attempt in range(1, max_attempts + 1):
-        headers = {"g-axs-tk": token}
+        headers = {"g-axs-tk": token} if provider == "google" else {"o-axs-tk": token}
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
@@ -125,9 +127,10 @@ def _request_node_with_retries(
 
 
 def _get_calendar_events(
-    google_access_token: str,
+    access_token: str,
     time_min: str,
     time_max: str,
+    provider: str = "google",
     max_results: int = 20,
     refresh_access_token: Callable[[], str | None] | None = None,
 ) -> list[dict]:
@@ -135,12 +138,13 @@ def _get_calendar_events(
         "timeMin": time_min,
         "timeMax": time_max,
         "maxResults": max_results,
-        "type": "google",
+        "type": provider,
     }
     result = _request_node_with_retries(
         method="GET",
         path="/api/calendar/events",
-        google_access_token=google_access_token,
+        access_token=access_token,
+        provider=provider,
         params=params,
         refresh_access_token=refresh_access_token,
         operation="agent_calendar_fetch",
@@ -171,8 +175,9 @@ def _get_calendar_events(
 
 
 def create_calendar_event(
-    google_access_token: str,
+    access_token: str,
     event_data: dict[str, Any],
+    provider: str = "google",
     refresh_access_token: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     body = {
@@ -181,12 +186,14 @@ def create_calendar_event(
         "endTime": event_data.get("endTime"),
         "description": event_data.get("description", ""),
         "attendees": event_data.get("attendees", []),
-        "type": "google",
+        "type": provider,
     }
     result = _request_node_with_retries(
         method="POST",
         path="/api/calendar/events",
-        google_access_token=google_access_token,
+        access_token=access_token,
+        provider=provider,
+        params={"type": provider},
         json_body=body,
         refresh_access_token=refresh_access_token,
         operation="agent_create_event",
@@ -217,7 +224,8 @@ def _extract_finalized(content: str) -> tuple[str, dict[str, Any] | None]:
 
 def generate_scheduling_reply(
     thread_messages: list[str],
-    google_access_token: str,
+    access_token: str,
+    provider: str = "google",
     sender_name: str = "Scheduler Team",
     context: str = "Schedule a meeting professionally.",
     refresh_access_token: Callable[[], str | None] | None = None,
@@ -255,7 +263,8 @@ def generate_scheduling_reply(
                 continue
             args = json.loads(tc.function.arguments or "{}")
             events = _get_calendar_events(
-                google_access_token=google_access_token,
+                access_token=access_token,
+                provider=provider,
                 time_min=args.get("timeMin", ""),
                 time_max=args.get("timeMax", ""),
                 max_results=int(args.get("maxResults", 20)),

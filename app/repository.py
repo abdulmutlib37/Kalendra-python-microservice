@@ -278,6 +278,84 @@ def mark_thread_message_processed(thread_doc_id: str, message_id: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def find_recent_active_thread_by_recipient(provider: str, user_email: str, recipient_email: str) -> dict:
+    """
+    Fallback lookup when provider thread IDs drift (especially cross-provider replies).
+    Returns a single active/open thread for this recipient if uniquely identifiable.
+    """
+    provider = provider.lower()
+    user_email = user_email.lower()
+    recipient_email = recipient_email.lower().strip()
+    prefix = f"{provider}::{user_email}::"
+    try:
+        candidates: list[tuple[str, dict]] = []
+        for doc in _threads_col().stream():
+            if not doc.id.startswith(prefix):
+                continue
+            data = doc.to_dict() or {}
+            if str(data.get("recipient_email", "")).lower().strip() != recipient_email:
+                continue
+            if str(data.get("status", "")).lower().strip() != "active":
+                continue
+            state = str(data.get("state", "open")).lower().strip()
+            if state not in {"open", "active"}:
+                continue
+            candidates.append((doc.id, data))
+
+        if len(candidates) == 1:
+            doc_id, data = candidates[0]
+            return {"ok": True, "data": {"thread_doc_id": doc_id, **data}}
+        if len(candidates) > 1:
+            return {"ok": False, "error": "ambiguous"}
+        return {"ok": False, "error": "not_found"}
+    except Exception as e:
+        log_event(
+            "thread_find_recent_active_by_recipient_failed",
+            provider=provider,
+            user_email=user_email,
+            recipient_email=recipient_email,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
+
+
+def find_single_active_thread_for_user(provider: str, user_email: str) -> dict:
+    """
+    Last-resort recovery: when exactly one active/open thread exists for user,
+    return it so incoming replies are not dropped due to thread-id drift.
+    """
+    provider = provider.lower()
+    user_email = user_email.lower()
+    prefix = f"{provider}::{user_email}::"
+    try:
+        candidates: list[tuple[str, dict]] = []
+        for doc in _threads_col().stream():
+            if not doc.id.startswith(prefix):
+                continue
+            data = doc.to_dict() or {}
+            if str(data.get("status", "")).lower().strip() != "active":
+                continue
+            state = str(data.get("state", "open")).lower().strip()
+            if state not in {"open", "active"}:
+                continue
+            candidates.append((doc.id, data))
+
+        if len(candidates) == 1:
+            doc_id, data = candidates[0]
+            return {"ok": True, "data": {"thread_doc_id": doc_id, **data}}
+        if len(candidates) > 1:
+            return {"ok": False, "error": "ambiguous"}
+        return {"ok": False, "error": "not_found"}
+    except Exception as e:
+        log_event(
+            "thread_find_single_active_for_user_failed",
+            provider=provider,
+            user_email=user_email,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # watch_state  (doc ID = provider::userEmail)
 # ---------------------------------------------------------------------------

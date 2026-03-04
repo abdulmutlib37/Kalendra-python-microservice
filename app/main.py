@@ -31,9 +31,12 @@ from app.repository import (
 )
 from app.token_manager import TokenManager
 from app.watch_service import (
+    initiate_outlook_email_flow,
     initiate_google_email_flow,
+    process_outlook_push,
     process_gmail_push,
     renew_gmail_watch,
+    renew_outlook_watch,
     verify_pubsub_auth_header,
 )
 
@@ -96,7 +99,10 @@ class TokenActionRequest(BaseModel):
 
 
 class InitiateEmailFlowRequest(BaseModel):
-    google_access_token: str
+    provider: str | None = "google"
+    access_token: str | None = None
+    google_access_token: str | None = None
+    outlook_access_token: str | None = None
     sender_name: str
     recipient_email: str
     recipient_name: str | None = None
@@ -118,6 +124,7 @@ async def root():
             "test_update": "GET /test/update — update sample thread",
             "renew_watches": "POST /renew-watches — renew expiring Gmail watches",
             "gmail_push": "POST /gmail/push — process Gmail push with agentic scheduling replies",
+            "outlook_push": "GET/POST /outlook/push — process Outlook webhook notifications",
             "initiate_email_flow": "POST /initiate-email-flow — start email scheduling thread (Node-compatible)",
             "test_token_store": "POST /test/token-store — store encrypted OAuth tokens",
             "test_token_refresh": "POST /test/token-refresh — refresh Google/Outlook token",
@@ -213,6 +220,21 @@ async def test_update():
 
 # ── Token endpoints ──────────────────────────────────────────────────────────
 
+@app.post("/store-tokens")
+async def store_tokens(payload: TokenStoreRequest):
+    """Store OAuth tokens (used by backend after Google auth code exchange)."""
+    ok = token_manager.store_tokens(
+        user_email=str(payload.user_email),
+        provider=payload.provider,
+        access_token=payload.access_token,
+        refresh_token=payload.refresh_token,
+        expires_in_seconds=payload.expires_in_seconds,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to store tokens")
+    return {"ok": True}
+
+
 @app.post("/test/token-store")
 async def test_token_store(payload: TokenStoreRequest):
     ok = token_manager.store_tokens(
@@ -254,8 +276,8 @@ async def revoke_user_token(payload: TokenActionRequest):
 @app.post("/renew-watches")
 async def renew_watches():
     """
-    Cloud Scheduler target (Google-only for now).
-    Finds watch_state rows expiring within 1 day and renews Gmail watches.
+    Cloud Scheduler target.
+    Finds watch_state rows expiring within 1 day and renews watches.
     """
     threshold = datetime.now(timezone.utc) + timedelta(days=1)
 
@@ -263,26 +285,31 @@ async def renew_watches():
     failed = 0
     failures: list[dict] = []
 
-    for doc_id, data in stream_watch_states(provider="google"):
-        expires_at = data.get("expires_at")
-        if not expires_at:
-            continue
-        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not isinstance(expires_at, datetime) or expires_at > threshold:
-            continue
+    for provider in ("google", "outlook"):
+        for doc_id, data in stream_watch_states(provider=provider):
+            expires_at = data.get("expires_at")
+            if not expires_at:
+                continue
+            if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if not isinstance(expires_at, datetime) or expires_at > threshold:
+                continue
 
-        parts = doc_id.split("::", 1)
-        user_email = parts[1] if len(parts) == 2 else doc_id
-        if not user_email:
-            continue
+            parts = doc_id.split("::", 1)
+            user_email = parts[1] if len(parts) == 2 else doc_id
+            if not user_email:
+                continue
 
-        result = renew_gmail_watch(user_email=user_email, token_manager=token_manager)
-        if result.get("ok"):
-            renewed += 1
-        else:
-            failed += 1
-            failures.append({"user_email": user_email, "error": result.get("error")})
+            result = (
+                renew_gmail_watch(user_email=user_email, token_manager=token_manager)
+                if provider == "google"
+                else renew_outlook_watch(user_email=user_email, token_manager=token_manager)
+            )
+            if result.get("ok"):
+                renewed += 1
+            else:
+                failed += 1
+                failures.append({"user_email": user_email, "provider": provider, "error": result.get("error")})
 
     log_event("watch_renewal_batch_complete", renewed=renewed, failed=failed)
     return {"ok": True, "renewed": renewed, "failed": failed, "failures": failures}
@@ -311,19 +338,70 @@ async def gmail_push(payload: dict, request: Request):
     return result
 
 
+@app.get("/outlook/push")
+async def outlook_push_validation(request: Request):
+    # Outlook subscription handshake
+    token = request.query_params.get("validationToken")
+    if token:
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(token)
+    return {"ok": True}
+
+
+@app.post("/outlook/push")
+async def outlook_push(request: Request, payload: dict | None = None):
+    # Outlook may send validationToken on POST during subscription handshake.
+    token = request.query_params.get("validationToken")
+    if token:
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(token)
+
+    result = process_outlook_push(push_payload=(payload or {}), token_manager=token_manager)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error")}
+    return result
+
+
 @app.post("/initiate-email-flow")
 async def initiate_email_flow(payload: InitiateEmailFlowRequest):
     """
     Node-compatible email flow bootstrap endpoint.
     """
-    result = initiate_google_email_flow(
-        google_access_token=payload.google_access_token,
-        sender_name=payload.sender_name,
-        recipient_email=payload.recipient_email,
-        recipient_name=payload.recipient_name,
-        context=payload.context or "",
-        token_manager=token_manager,
-    )
+    provider = (payload.provider or "google").lower().strip()
+    # Backward/compat fallback:
+    # if provider was omitted/defaulted to google but only outlook token is present,
+    # treat this request as outlook instead of failing with google token required.
+    if provider == "google":
+        has_google = bool((payload.access_token or payload.google_access_token or "").strip())
+        has_outlook = bool((payload.outlook_access_token or "").strip())
+        if not has_google and has_outlook:
+            provider = "outlook"
+
+    if provider not in {"google", "outlook"}:
+        raise HTTPException(status_code=400, detail="provider must be google or outlook")
+
+    if provider == "google":
+        token = (payload.access_token or payload.google_access_token or "").strip()
+        result = initiate_google_email_flow(
+            google_access_token=token,
+            sender_name=payload.sender_name,
+            recipient_email=payload.recipient_email,
+            recipient_name=payload.recipient_name,
+            context=payload.context or "",
+            token_manager=token_manager,
+        )
+    else:
+        token = (payload.access_token or payload.outlook_access_token or "").strip()
+        result = initiate_outlook_email_flow(
+            outlook_access_token=token,
+            sender_name=payload.sender_name,
+            recipient_email=payload.recipient_email,
+            recipient_name=payload.recipient_name,
+            context=payload.context or "",
+            token_manager=token_manager,
+        )
     if not result.get("ok"):
         status_code = int(result.get("status_code") or 500)
         raise HTTPException(status_code=status_code, detail=result.get("error", "initiate_email_flow_failed"))
