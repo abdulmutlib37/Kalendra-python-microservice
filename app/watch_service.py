@@ -50,6 +50,10 @@ def _extract_subject_from_context(context: str) -> str:
     if quoted and quoted.group(1).strip():
         return quoted.group(1).strip()
 
+    title_word = re.search(r"\btitle(?:d)?\s+([^\n\r,.!?]+)", text, flags=re.IGNORECASE)
+    if title_word and title_word.group(1).strip():
+        return title_word.group(1).strip().strip(" .,:;-")
+
     subject_like = re.search(r"subject\s*[:=-]\s*([^\n\r]+)", text, flags=re.IGNORECASE)
     if subject_like and subject_like.group(1).strip():
         return subject_like.group(1).strip().strip(" .,:;-")
@@ -65,21 +69,16 @@ def _extract_human_detail_from_context(context: str) -> str:
     if not text:
         return ""
 
-    # Remove robotic instruction style prefixes.
+    # Remove robotic instruction style wrappers while retaining useful scheduling details.
     text = re.sub(r"^user requested to\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^please\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^initiate (an )?email flow with\s+[^ ]+\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" .")
 
-    lower = text.lower()
-    if lower.startswith("schedule a meeting titled"):
-        # Keep only practical scheduling detail if available (e.g. "next week").
-        if "next week" in lower:
-            return "I am looking to schedule this for next week."
+    if len(text) < 10:
         return ""
-
-    if len(text) < 12:
-        return ""
-    return text
+    # Keep detail concise and human.
+    return text[:220].strip()
 
 
 def _request_gmail(token: str, method: str, path: str, **kwargs) -> httpx.Response:

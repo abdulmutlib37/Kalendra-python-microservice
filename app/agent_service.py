@@ -139,6 +139,7 @@ def _get_calendar_events(
         "timeMax": time_max,
         "maxResults": max_results,
         "type": provider,
+        "includeTasks": "false",
     }
     result = _request_node_with_retries(
         method="GET",
