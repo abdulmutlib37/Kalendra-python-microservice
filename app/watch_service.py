@@ -15,13 +15,19 @@ import re
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import parseaddr
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from google.auth.transport import requests as g_requests
 from google.oauth2 import id_token as g_id_token
 
-from app.agent_service import create_calendar_event, generate_scheduling_reply
+from app.agent_service import (
+    create_calendar_event,
+    find_conflicting_event,
+    generate_initial_email,
+    generate_scheduling_reply,
+    normalize_finalized_event_times,
+)
 from app.logging_config import log_event
 from app.repository import (
     create_thread,
@@ -81,30 +87,72 @@ def _extract_human_detail_from_context(context: str) -> str:
     return text[:220].strip()
 
 
-def _request_gmail(token: str, method: str, path: str, **kwargs) -> httpx.Response:
+def _request_gmail(
+    token: str,
+    method: str,
+    path: str,
+    refresh_access_token: Callable[[], str | None] | None = None,
+    **kwargs,
+) -> httpx.Response:
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
     headers["Content-Type"] = "application/json"
-    return httpx.request(
+    resp = httpx.request(
         method=method,
         url=f"{GMAIL_API_BASE}{path}",
         headers=headers,
         timeout=20.0,
         **kwargs,
     )
+    if resp.status_code == 401 and refresh_access_token:
+        try:
+            refreshed = (refresh_access_token() or "").strip()
+        except Exception:
+            refreshed = ""
+        if refreshed:
+            headers["Authorization"] = f"Bearer {refreshed}"
+            resp = httpx.request(
+                method=method,
+                url=f"{GMAIL_API_BASE}{path}",
+                headers=headers,
+                timeout=20.0,
+                **kwargs,
+            )
+    return resp
 
 
-def _request_outlook(token: str, method: str, path: str, **kwargs) -> httpx.Response:
+def _request_outlook(
+    token: str,
+    method: str,
+    path: str,
+    refresh_access_token: Callable[[], str | None] | None = None,
+    **kwargs,
+) -> httpx.Response:
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
     headers["Content-Type"] = "application/json"
-    return httpx.request(
+    resp = httpx.request(
         method=method,
         url=f"{OUTLOOK_API_BASE}{path}",
         headers=headers,
         timeout=20.0,
         **kwargs,
     )
+    if resp.status_code == 401 and refresh_access_token:
+        try:
+            refreshed = (refresh_access_token() or "").strip()
+        except Exception:
+            refreshed = ""
+        if refreshed:
+            headers["Authorization"] = f"Bearer {refreshed}"
+            resp = httpx.request(
+                method=method,
+                url=f"{OUTLOOK_API_BASE}{path}",
+                headers=headers,
+                timeout=20.0,
+                **kwargs,
+            )
+    return resp
 
 
 def verify_pubsub_auth_header(auth_header: str | None, expected_audience: str) -> dict[str, Any]:
@@ -294,11 +342,16 @@ def _send_noted_reply(token: str, user_email: str, thread_id: str, message_id: s
     return True
 
 
-def _get_message_metadata(token: str, message_id: str) -> dict[str, str] | None:
+def _get_message_metadata(
+    token: str,
+    message_id: str,
+    refresh_access_token: Callable[[], str | None] | None = None,
+) -> dict[str, str] | None:
     resp = _request_gmail(
         token,
         "GET",
         f"/messages/{message_id}",
+        refresh_access_token=refresh_access_token,
         params={"format": "metadata", "metadataHeaders": ["From", "Subject", "Message-ID"]},
     )
     if resp.status_code != 200:
@@ -313,8 +366,18 @@ def _get_message_metadata(token: str, message_id: str) -> dict[str, str] | None:
     }
 
 
-def _get_thread_messages_for_agent(token: str, thread_id: str) -> list[str]:
-    resp = _request_gmail(token, "GET", f"/threads/{thread_id}", params={"format": "metadata", "metadataHeaders": ["From", "Subject"]})
+def _get_thread_messages_for_agent(
+    token: str,
+    thread_id: str,
+    refresh_access_token: Callable[[], str | None] | None = None,
+) -> list[str]:
+    resp = _request_gmail(
+        token,
+        "GET",
+        f"/threads/{thread_id}",
+        refresh_access_token=refresh_access_token,
+        params={"format": "metadata", "metadataHeaders": ["From", "Subject"]},
+    )
     if resp.status_code != 200:
         log_event("gmail_thread_fetch_failed", thread_id=thread_id, status_code=resp.status_code)
         return []
@@ -342,13 +405,81 @@ def _is_finalization_confident(thread_messages: list[str]) -> bool:
     has_acceptance = bool(
         re.search(r"\b(yes|confirmed|confirm|works for me|that works|sounds good|see you|agreed|perfect)\b", latest)
     )
-    has_time_signal = bool(
+    latest_time_signal = bool(
         re.search(
             r"\b(\d{1,2}(:\d{2})?\s?(am|pm)|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|utc|gmt)\b",
             latest,
         )
     )
-    return has_acceptance and has_time_signal
+    recent_context = "\n".join((thread_messages or [])[-4:]).lower()
+    recent_time_signal = bool(
+        re.search(
+            r"\b(\d{1,2}(:\d{2})?\s?(am|pm)|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|utc|gmt)\b",
+            recent_context,
+        )
+    )
+    return has_acceptance and (latest_time_signal or recent_time_signal)
+
+
+def _latest_message_allows_conflict(thread_messages: list[str]) -> bool:
+    if not thread_messages:
+        return False
+    latest = (thread_messages[-1] or "").lower()
+    return bool(
+        re.search(
+            r"\b(book it anyway|schedule anyway|still book|still schedule|conflict is fine|i am okay with conflict|go ahead anyway)\b",
+            latest,
+        )
+    )
+
+
+def _latest_inbound_text(thread_messages: list[str]) -> str:
+    if not thread_messages:
+        return ""
+    latest = (thread_messages[-1] or "")
+    parts = latest.split("\n", 1)
+    if len(parts) == 2:
+        return parts[1].strip()
+    return latest.strip()
+
+
+def _is_offtopic_email_request(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    return bool(
+        re.search(
+            r"\b(trump|epstein|politics|crypto price|stock tips|weather|sports score|movie|music|news)\b",
+            t,
+        )
+    )
+
+
+def _is_sensitive_calendar_data_request(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    return bool(
+        re.search(
+            r"\b(what is your calendar like|who is in your meeting|who all|last time you met|last meeting with|all bookings|share your calendar|meeting with)\b",
+            t,
+        )
+    )
+
+
+def _guardrail_override_reply(thread_messages: list[str]) -> str | None:
+    latest_text = _latest_inbound_text(thread_messages)
+    if _is_offtopic_email_request(latest_text):
+        return (
+            "I can help with meeting scheduling in this thread. "
+            "Please share a time window that works for you and I will coordinate it."
+        )
+    if _is_sensitive_calendar_data_request(latest_text):
+        return (
+            "I can only share high-level availability for scheduling and cannot share private meeting details. "
+            "If helpful, I can propose open time slots for our meeting."
+        )
+    return None
 
 
 def _send_agent_reply(
@@ -359,6 +490,7 @@ def _send_agent_reply(
     body: str,
     thread_id: str,
     parent_message_id: str,
+    refresh_access_token: Callable[[], str | None] | None = None,
 ) -> bool:
     subj = subject.strip() or "Re:"
     if not subj.lower().startswith("re:"):
@@ -373,7 +505,13 @@ def _send_agent_reply(
         f"{body}"
     )
     raw_b64 = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
-    send_resp = _request_gmail(token, "POST", "/messages/send", json={"raw": raw_b64, "threadId": thread_id})
+    send_resp = _request_gmail(
+        token,
+        "POST",
+        "/messages/send",
+        refresh_access_token=refresh_access_token,
+        json={"raw": raw_b64, "threadId": thread_id},
+    )
     if send_resp.status_code not in (200, 202):
         log_event(
             "agent_reply_send_failed",
@@ -395,33 +533,18 @@ def _send_initial_thread_email(
 ) -> tuple[str | None, str | None]:
     """
     Send the first email in a scheduling flow and return (thread_id, message_id).
+    Uses LLM-generated initial message in email-poc style.
     """
     context_text = (context or "").strip()
-    subject = _extract_subject_from_context(context_text)
-    detail_line = _extract_human_detail_from_context(context_text)
-
-    greeting_name = (recipient_name or "").strip()
-    salutation = f"Hi {greeting_name}," if greeting_name else "Hi,"
-
-    body_lines = [
-        salutation,
-        "",
-        "I would like to schedule a meeting with you.",
-    ]
-    if detail_line:
-        body_lines.extend(["", detail_line])
-    body_lines.extend(
-        [
-            "",
-            "Please share a suitable time.",
-            "",
-            "Regards,",
-            sender_name,
-            "",
-            "Email Scheduling - Powered by Kalendra",
-        ]
-    )
-    body = "\n".join(body_lines)
+    try:
+        subject, body = generate_initial_email(
+            sender_name=sender_name,
+            recipient_name=(recipient_name or "").strip() or "there",
+            context=context_text or "schedule a meeting",
+        )
+    except Exception as exc:
+        log_event("initial_email_llm_failed", error=str(exc), to=to_email)
+        return None, None
 
     msg = MIMEText(body)
     msg["To"] = to_email
@@ -499,6 +622,8 @@ def initiate_google_email_flow(
     recipient_email: str,
     recipient_name: str | None,
     context: str,
+    user_timezone: str | None = None,
+    user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
 ) -> dict[str, Any]:
     """
@@ -561,6 +686,8 @@ def initiate_google_email_flow(
             "sender_name": sender_name,
             "recipient_email": recipient_email.lower(),
             "recipient_name": (recipient_name or "").strip(),
+            "user_timezone": (user_timezone or "").strip(),
+            "user_timezone_offset_minutes": user_timezone_offset_minutes,
             "attendees": [recipient_email.lower()],
             "source": "node_execute_initiate_email_flow",
             "initiated_at": datetime.now(timezone.utc),
@@ -611,32 +738,20 @@ def _send_initial_outlook_thread_email(
     recipient_name: str | None,
     context: str,
 ) -> dict[str, Any]:
+    """
+    Send the first email in an Outlook scheduling flow.
+    Uses LLM-generated initial message in email-poc style.
+    """
     context_text = (context or "").strip()
-    subject = _extract_subject_from_context(context_text)
-    detail_line = _extract_human_detail_from_context(context_text)
-
-    greeting_name = (recipient_name or "").strip()
-    salutation = f"Hi {greeting_name}," if greeting_name else "Hi,"
-
-    body_lines = [
-        salutation,
-        "",
-        "I would like to schedule a meeting with you.",
-    ]
-    if detail_line:
-        body_lines.extend(["", detail_line])
-    body_lines.extend(
-        [
-            "",
-            "Please share a suitable time.",
-            "",
-            "Regards,",
-            sender_name,
-            "",
-            "Email Scheduling - Powered by Kalendra",
-        ]
-    )
-    body = "\n".join(body_lines)
+    try:
+        subject, body = generate_initial_email(
+            sender_name=sender_name,
+            recipient_name=(recipient_name or "").strip() or "there",
+            context=context_text or "schedule a meeting",
+        )
+    except Exception as exc:
+        log_event("initial_email_llm_failed", error=str(exc), to=to_email)
+        return {"ok": False, "error": f"initial_email_llm_failed:{exc}", "status_code": 502}
 
     draft_resp = _request_outlook(
         token,
@@ -751,6 +866,8 @@ def initiate_outlook_email_flow(
     recipient_email: str,
     recipient_name: str | None,
     context: str,
+    user_timezone: str | None = None,
+    user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
 ) -> dict[str, Any]:
     token = (outlook_access_token or "").strip()
@@ -809,6 +926,8 @@ def initiate_outlook_email_flow(
             "sender_name": sender_name,
             "recipient_email": recipient_email.lower(),
             "recipient_name": (recipient_name or "").strip(),
+            "user_timezone": (user_timezone or "").strip(),
+            "user_timezone_offset_minutes": user_timezone_offset_minutes,
             "attendees": [recipient_email.lower()],
             "source": "node_execute_initiate_email_flow",
             "initiated_at": datetime.now(timezone.utc),
@@ -864,6 +983,7 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
             token,
             "GET",
             f"/me/messages/{message_id}?$select=id,conversationId,subject,from,bodyPreview,internetMessageId",
+            refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
         )
         if msg_resp.status_code != 200:
             continue
@@ -905,11 +1025,44 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
             sender_name=thread_data.get("sender_name", "Scheduler Team"),
             context=thread_data.get("context", "Schedule a meeting via email."),
             refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+            user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+            user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
         )
         if not reply_text:
             continue
+        guardrail_text = _guardrail_override_reply(convo)
+        if guardrail_text:
+            reply_text = guardrail_text
+            finalized_payload = None
 
-        reply_resp = _request_outlook(token, "POST", f"/me/messages/{message_id}/reply", json={"comment": reply_text})
+        if finalized_payload and _is_finalization_confident(convo):
+            finalized_payload = normalize_finalized_event_times(
+                finalized_payload,
+                user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+                user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
+            )
+            conflict = find_conflicting_event(
+                access_token=token,
+                event_data=finalized_payload,
+                provider="outlook",
+                refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+            )
+            if conflict and not _latest_message_allows_conflict(convo):
+                conflict_title = conflict.get("summary") or "another meeting"
+                conflict_start = conflict.get("startLocal") or conflict.get("start") or "that time"
+                reply_text = (
+                    f"I noticed a calendar conflict with {conflict_title} around {conflict_start}. "
+                    "Would you like me to pick another slot, or should I book this anyway?"
+                )
+                finalized_payload = None
+
+        reply_resp = _request_outlook(
+            token,
+            "POST",
+            f"/me/messages/{message_id}/reply",
+            refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+            json={"comment": reply_text},
+        )
         if reply_resp.status_code not in (200, 202):
             continue
         replied += 1
@@ -929,6 +1082,14 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
 
         if finalized_payload:
             if _is_finalization_confident(convo):
+                existing_attendees = finalized_payload.get("attendees") or []
+                normalized = {
+                    str(a).strip().lower()
+                    for a in existing_attendees
+                    if isinstance(a, str) and str(a).strip()
+                }
+                normalized.update({user_email.lower(), from_email.lower()})
+                finalized_payload["attendees"] = sorted(normalized)
                 create_result = create_calendar_event(
                     token,
                     finalized_payload,
@@ -983,6 +1144,7 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
         token,
         "GET",
         "/history",
+        refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
         params={"startHistoryId": old_history_id, "historyTypes": "messageAdded"},
     )
     if history_resp.status_code != 200:
@@ -1019,7 +1181,11 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if not msg_id or not thread_id:
                     continue
 
-                meta = _get_message_metadata(token, msg_id)
+                meta = _get_message_metadata(
+                    token,
+                    msg_id,
+                    refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                )
                 if not meta:
                     continue
                 from_email = parseaddr(meta["from"])[1].lower()
@@ -1102,7 +1268,11 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     log_event("agent_max_turns_reached", thread_doc_id=thread_doc_id, turn_count=turn_count)
                     continue
 
-                convo = _get_thread_messages_for_agent(token, thread_id)
+                convo = _get_thread_messages_for_agent(
+                    token,
+                    thread_id,
+                    refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                )
                 if not convo:
                     continue
                 reply_text, finalized_payload = generate_scheduling_reply(
@@ -1112,9 +1282,36 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     sender_name=thread_data.get("sender_name", "Scheduler Team"),
                     context=thread_data.get("context", "Schedule a meeting via email."),
                     refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                    user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+                    user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
                 )
                 if not reply_text:
                     continue
+                guardrail_text = _guardrail_override_reply(convo)
+                if guardrail_text:
+                    reply_text = guardrail_text
+                    finalized_payload = None
+
+                if finalized_payload and _is_finalization_confident(convo):
+                    finalized_payload = normalize_finalized_event_times(
+                        finalized_payload,
+                        user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+                        user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
+                    )
+                    conflict = find_conflicting_event(
+                        access_token=token,
+                        event_data=finalized_payload,
+                        provider="google",
+                        refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                    )
+                    if conflict and not _latest_message_allows_conflict(convo):
+                        conflict_title = conflict.get("summary") or "another meeting"
+                        conflict_start = conflict.get("startLocal") or conflict.get("start") or "that time"
+                        reply_text = (
+                            f"I noticed a calendar conflict with {conflict_title} around {conflict_start}. "
+                            "Would you like me to pick another slot, or should I book this anyway?"
+                        )
+                        finalized_payload = None
 
                 sent = _send_agent_reply(
                     token=token,
@@ -1124,6 +1321,7 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     body=reply_text,
                     thread_id=thread_id,
                     parent_message_id=meta.get("message_id_header", ""),
+                    refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
                 )
                 if not sent:
                     continue
@@ -1143,6 +1341,14 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
 
                 if finalized_payload:
                     if _is_finalization_confident(convo):
+                        existing_attendees = finalized_payload.get("attendees") or []
+                        normalized = {
+                            str(a).strip().lower()
+                            for a in existing_attendees
+                            if isinstance(a, str) and str(a).strip()
+                        }
+                        normalized.update({email_address.lower(), from_email.lower()})
+                        finalized_payload["attendees"] = sorted(normalized)
                         create_result = create_calendar_event(
                             token,
                             finalized_payload,

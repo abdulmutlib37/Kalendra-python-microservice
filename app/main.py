@@ -107,6 +107,8 @@ class InitiateEmailFlowRequest(BaseModel):
     recipient_email: str
     recipient_name: str | None = None
     context: str | None = None
+    user_timezone: str | None = None
+    user_timezone_offset_minutes: int | None = None
 
 
 # ── Core routes ──────────────────────────────────────────────────────────────
@@ -390,6 +392,8 @@ async def initiate_email_flow(payload: InitiateEmailFlowRequest):
             recipient_email=payload.recipient_email,
             recipient_name=payload.recipient_name,
             context=payload.context or "",
+            user_timezone=(payload.user_timezone or "").strip() or None,
+            user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
             token_manager=token_manager,
         )
     else:
@@ -400,6 +404,8 @@ async def initiate_email_flow(payload: InitiateEmailFlowRequest):
             recipient_email=payload.recipient_email,
             recipient_name=payload.recipient_name,
             context=payload.context or "",
+            user_timezone=(payload.user_timezone or "").strip() or None,
+            user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
             token_manager=token_manager,
         )
     if not result.get("ok"):
