@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.logging_config import (
@@ -107,6 +107,8 @@ class InitiateEmailFlowRequest(BaseModel):
     recipient_email: str
     recipient_name: str | None = None
     context: str | None = None
+    email_subject: str | None = None
+    email_body: str | None = None
     user_timezone: str | None = None
     user_timezone_offset_minutes: int | None = None
 
@@ -366,6 +368,27 @@ async def outlook_push(request: Request, payload: dict | None = None):
     return result
 
 
+@app.post("/generate-email-draft")
+async def generate_email_draft_endpoint(
+    sender_name: str = Body(...),
+    recipient_name: str = Body(...),
+    context: str = Body(...),
+):
+    """
+    Generate email draft (subject + body) for preview in confirmation dialog.
+    """
+    try:
+        subject, body = generate_initial_email(
+            sender_name=sender_name,
+            recipient_name=recipient_name or "there",
+            context=context or "schedule a meeting",
+        )
+        return {"subject": subject, "body": body}
+    except Exception as exc:
+        log_event("email_draft_generation_failed", error=str(exc))
+        raise HTTPException(status_code=500, detail=f"Failed to generate email draft: {str(exc)}")
+
+
 @app.post("/initiate-email-flow")
 async def initiate_email_flow(payload: InitiateEmailFlowRequest):
     """
@@ -392,6 +415,8 @@ async def initiate_email_flow(payload: InitiateEmailFlowRequest):
             recipient_email=payload.recipient_email,
             recipient_name=payload.recipient_name,
             context=payload.context or "",
+            email_subject=payload.email_subject,
+            email_body=payload.email_body,
             user_timezone=(payload.user_timezone or "").strip() or None,
             user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
             token_manager=token_manager,
@@ -404,6 +429,8 @@ async def initiate_email_flow(payload: InitiateEmailFlowRequest):
             recipient_email=payload.recipient_email,
             recipient_name=payload.recipient_name,
             context=payload.context or "",
+            email_subject=payload.email_subject,
+            email_body=payload.email_body,
             user_timezone=(payload.user_timezone or "").strip() or None,
             user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
             token_manager=token_manager,

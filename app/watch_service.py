@@ -530,21 +530,29 @@ def _send_initial_thread_email(
     sender_name: str,
     recipient_name: str | None,
     context: str,
+    custom_subject: str | None = None,
+    custom_body: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Send the first email in a scheduling flow and return (thread_id, message_id).
-    Uses LLM-generated initial message in email-poc style.
+    Uses custom subject/body if provided, otherwise generates via LLM.
     """
     context_text = (context or "").strip()
-    try:
-        subject, body = generate_initial_email(
-            sender_name=sender_name,
-            recipient_name=(recipient_name or "").strip() or "there",
-            context=context_text or "schedule a meeting",
-        )
-    except Exception as exc:
-        log_event("initial_email_llm_failed", error=str(exc), to=to_email)
-        return None, None
+    
+    # Use custom subject/body if provided (from frontend edits), otherwise generate
+    if custom_subject and custom_body:
+        subject = custom_subject.strip()
+        body = custom_body.strip()
+    else:
+        try:
+            subject, body = generate_initial_email(
+                sender_name=sender_name,
+                recipient_name=(recipient_name or "").strip() or "there",
+                context=context_text or "schedule a meeting",
+            )
+        except Exception as exc:
+            log_event("initial_email_llm_failed", error=str(exc), to=to_email)
+            return None, None
 
     msg = MIMEText(body)
     msg["To"] = to_email
@@ -622,6 +630,8 @@ def initiate_google_email_flow(
     recipient_email: str,
     recipient_name: str | None,
     context: str,
+    email_subject: str | None = None,
+    email_body: str | None = None,
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
@@ -670,6 +680,8 @@ def initiate_google_email_flow(
         sender_name=sender_name,
         recipient_name=recipient_name,
         context=context or "",
+        custom_subject=email_subject,
+        custom_body=email_body,
     )
     if not thread_id:
         return {"ok": False, "error": "failed_to_send_initial_email", "status_code": 502}
@@ -696,23 +708,47 @@ def initiate_google_email_flow(
     if not created.get("ok"):
         return {"ok": False, "error": created.get("error", "thread_create_failed"), "status_code": 500}
 
-    enable_watch_setup = os.getenv("ENABLE_INITIATE_WATCH_SETUP", "false").lower() == "true"
+    enable_watch_setup = os.getenv("ENABLE_INITIATE_WATCH_SETUP", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    require_watch_setup = os.getenv("REQUIRE_WATCH_SETUP_ON_INITIATE", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
     watch_result: dict[str, Any] = {"ok": True, "skipped": not enable_watch_setup}
     if enable_watch_setup:
         watch_result = _ensure_watch_with_access_token(token=token, user_email=user_email)
         if not watch_result.get("ok"):
+            event_name = "gmail_watch_setup_failed" if require_watch_setup else "gmail_watch_setup_warning"
             log_event(
-                "gmail_watch_setup_warning",
+                event_name,
                 user_email=user_email,
                 thread_id=thread_id,
                 error=watch_result.get("error"),
             )
+            if require_watch_setup:
+                return {
+                    "ok": False,
+                    "error": watch_result.get("error", "gmail_watch_setup_failed"),
+                    "status_code": 502,
+                }
     else:
         log_event(
             "gmail_watch_setup_skipped_on_initiate",
             user_email=user_email,
             thread_id=thread_id,
         )
+        if require_watch_setup:
+            return {
+                "ok": False,
+                "error": "gmail_watch_setup_required_but_disabled",
+                "status_code": 500,
+            }
 
     log_event(
         "email_flow_initiated",
@@ -737,21 +773,29 @@ def _send_initial_outlook_thread_email(
     sender_name: str,
     recipient_name: str | None,
     context: str,
+    custom_subject: str | None = None,
+    custom_body: str | None = None,
 ) -> dict[str, Any]:
     """
     Send the first email in an Outlook scheduling flow.
-    Uses LLM-generated initial message in email-poc style.
+    Uses custom subject/body if provided, otherwise generates via LLM.
     """
     context_text = (context or "").strip()
-    try:
-        subject, body = generate_initial_email(
-            sender_name=sender_name,
-            recipient_name=(recipient_name or "").strip() or "there",
-            context=context_text or "schedule a meeting",
-        )
-    except Exception as exc:
-        log_event("initial_email_llm_failed", error=str(exc), to=to_email)
-        return {"ok": False, "error": f"initial_email_llm_failed:{exc}", "status_code": 502}
+    
+    # Use custom subject/body if provided (from frontend edits), otherwise generate
+    if custom_subject and custom_body:
+        subject = custom_subject.strip()
+        body = custom_body.strip()
+    else:
+        try:
+            subject, body = generate_initial_email(
+                sender_name=sender_name,
+                recipient_name=(recipient_name or "").strip() or "there",
+                context=context_text or "schedule a meeting",
+            )
+        except Exception as exc:
+            log_event("initial_email_llm_failed", error=str(exc), to=to_email)
+            return {"ok": False, "error": f"initial_email_llm_failed:{exc}", "status_code": 502}
 
     draft_resp = _request_outlook(
         token,
@@ -866,6 +910,8 @@ def initiate_outlook_email_flow(
     recipient_email: str,
     recipient_name: str | None,
     context: str,
+    email_subject: str | None = None,
+    email_body: str | None = None,
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
@@ -903,6 +949,8 @@ def initiate_outlook_email_flow(
         sender_name=sender_name,
         recipient_name=recipient_name,
         context=context or "",
+        custom_subject=email_subject,
+        custom_body=email_body,
     )
     if not send_result.get("ok"):
         return {
