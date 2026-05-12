@@ -28,6 +28,7 @@ from app.agent_service import (
     generate_scheduling_reply,
     normalize_finalized_event_times,
 )
+from app.fcm_service import send_flow_completed, send_flow_update
 from app.logging_config import log_event
 from app.repository import (
     create_thread,
@@ -1191,6 +1192,11 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
                         refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
                         json={"comment": confirm_text},
                     )
+                    send_flow_completed(
+                        user_email=user_email,
+                        recipient_name=thread_data.get("recipient_name", ""),
+                        recipient_email=from_email,
+                    )
                     delete_thread(thread_doc_id)
                     finalized += 1
                     replied += 1
@@ -1211,6 +1217,11 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
         )
         if reply_resp.status_code not in (200, 202):
             continue
+        send_flow_update(
+            user_email=user_email,
+            recipient_name=thread_data.get("recipient_name", ""),
+            recipient_email=from_email,
+        )
         replied += 1
 
         save_thread(thread_doc_id, {
@@ -1491,6 +1502,11 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                                 thread_id=thread_id, parent_message_id=meta.get("message_id_header", ""),
                                 refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
                             )
+                            send_flow_completed(
+                                user_email=email_address,
+                                recipient_name=thread_data.get("recipient_name", ""),
+                                recipient_email=from_email,
+                            )
                             delete_thread(thread_doc_id)
                             finalized += 1
                             replied += 1
@@ -1514,6 +1530,11 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if not sent:
                     continue
 
+                send_flow_update(
+                    user_email=email_address,
+                    recipient_name=thread_data.get("recipient_name", ""),
+                    recipient_email=from_email,
+                )
                 replied += 1
                 save_thread(thread_doc_id, {
                     "gmail_thread_id": thread_id, "status": "active", "state": "open",
