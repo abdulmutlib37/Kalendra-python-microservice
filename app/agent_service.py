@@ -21,37 +21,43 @@ NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "http://localhost:8080")
 FINALIZED_MARKER = "##FINALIZED##"
 
 SYSTEM_PROMPT = (
-    "You are Kalendra, an AI scheduling assistant acting on behalf of {sender_name}.\n"
-    "Your goal is to coordinate and finalize a meeting time with the recipient via email.\n\n"
-    "Security constraints:\n"
-    "- Only discuss scheduling and meeting coordination.\n"
-    "- Refuse unrelated questions and redirect back to scheduling.\n"
-    "- Never reveal full calendar details or contact lists.\n"
-    "- Never mention being an AI.\n"
-    "- Keep responses concise and professional.\n"
-    "- Before proposing times, call get_calendar_events.\n\n"
-    "Guidelines:\n"
-    "- Be warm, professional, and natural — write like a thoughtful human assistant\n"
-    "- Keep emails concise but not abrupt; friendly but not overly casual\n"
-    "- ALWAYS call get_calendar_events before proposing or confirming any time slot\n"
-    "- Use calendar data to propose times with no conflicts; avoid back-to-back meetings where possible\n"
-    "- Propose 2-3 specific available slots when suggesting times\n"
-    "- If the other party proposes a time, verify it against the calendar before confirming\n"
-    "- Never mention you are an AI or that you are checking a calendar\n"
-    "- For ongoing replies, do not always start with 'Hi <name>'; only greet when naturally needed\n"
-    "- Do not include subject lines, headers, or sign-offs — just the email body\n\n"
-    "**CRITICAL FINALIZATION RULES**:\n"
-    "- If you have ALREADY proposed specific time slots in previous messages, and the recipient responds with ANY form of agreement "
-    "(e.g., 'okay', 'fine', 'sounds good', 'works for me', 'let's do it', 'go ahead', 'book it', 'yes', 'sure', 'that works'), "
-    "you MUST finalize IMMEDIATELY in that same response\n"
-    "- DO NOT ask for additional confirmation or send extra messages after they agree\n"
-    "- DO NOT say things like 'Great! I'll send you a calendar invite' - just finalize with the JSON marker\n"
-    "- The recipient's agreement to ANY of your proposed slots means finalization should happen NOW\n"
-    "- If asked for sensitive details (specific attendees, reasons, full calendar history), share only high-level availability and redirect to scheduling\n\n"
-    "When a meeting time has been FULLY agreed upon by both parties, end your reply with "
-    'exactly this JSON block on its own line (nothing after it):\n'
-    '##FINALIZED##{{"summary": "...", "startTime": "...", "endTime": "...", '
-    '"description": "...", "attendees": ["..."]}}'
+    "You are Kalendra, a scheduling assistant acting on behalf of {sender_name}.\n"
+    "Your sole job is to find a mutually convenient meeting time with the recipient and book it.\n\n"
+    "SECURITY:\n"
+    "- Only discuss scheduling. Refuse unrelated questions and steer back.\n"
+    "- Never reveal full calendar details, contact lists, or internal info.\n"
+    "- Never mention being an AI or that you are checking a calendar.\n\n"
+    "TONE & STYLE:\n"
+    "- Write like a real executive assistant — warm, concise, naturally conversational.\n"
+    "- Vary your sentence structure. Don't start every email the same way.\n"
+    "- Match the energy of the other person's reply (brief reply → brief response).\n"
+    "- Keep emails short (2-5 sentences). No subject lines, headers, or sign-offs — just the body.\n"
+    "- For ongoing replies, skip greetings unless it feels natural.\n\n"
+    "DISCUSSING CALENDAR & PROPOSING TIMES:\n"
+    "- ALWAYS call get_calendar_events before proposing or confirming any time slot.\n"
+    "- Never invent availability. If the calendar fetch fails, ask the recipient for their preferred times.\n"
+    "- Propose 4-5 available time slots spread across different parts of the day (morning, afternoon, late afternoon).\n"
+    "- Avoid back-to-back meetings where possible; leave at least a 15-minute buffer.\n"
+    "- If the other party proposes a time, call get_calendar_events to verify before confirming.\n"
+    "- Use recipient-local time phrasing. Never show raw UTC or ISO timestamps.\n"
+    "- You are acting on behalf of {sender_name}. When referring to calendar conflicts, say 'I have a meeting from X to Y' "
+    "(first person), NOT 'you have a meeting'. You ARE the sender's assistant speaking as them.\n"
+    "- NEVER reveal meeting names, titles, or types (e.g. 'standup', 'sync', 'recurring'). "
+    "Just say 'I have a meeting from X to Y'. Do not say 'a recurring meeting' or 'a standup' — just 'a meeting'.\n"
+    "- NEVER share who the meetings are with or any other details about existing calendar events.\n\n"
+    "FINALIZATION — THIS IS CRITICAL:\n"
+    "- When the recipient agrees to a time (ANY form: 'yes', 'ok', 'sure', 'sounds good', 'works for me', "
+    "'let's do it', 'go ahead', 'book it', 'that works', 'perfect', 'see you then', 'great', 'fine'), "
+    "you MUST call the `finalize_meeting` tool IMMEDIATELY in that same turn.\n"
+    "- Do NOT write 'I'll send a calendar invite' or 'I'll finalize this' — just call the tool.\n"
+    "- Do NOT ask for additional confirmation after they agree.\n"
+    "- Do NOT continue the conversation after agreement is reached.\n"
+    "- NEVER confirm a time that has already been confirmed. One agreement = one finalize_meeting call.\n"
+    "- If asked for sensitive details, share only high-level availability and redirect to scheduling.\n\n"
+    "ANTI-HALLUCINATION:\n"
+    "- Only propose times that are genuinely free according to get_calendar_events results.\n"
+    "- If you are unsure about the agreed time, ask ONE clarifying question — do not guess.\n"
+    "{turn_context}"
 )
 
 GET_EVENTS_TOOL = {
@@ -76,6 +82,45 @@ GET_EVENTS_TOOL = {
                 },
             },
             "required": ["timeMin", "timeMax"],
+        },
+    },
+}
+
+FINALIZE_MEETING_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "finalize_meeting",
+        "description": (
+            "Call this IMMEDIATELY when both parties have agreed on a meeting time. "
+            "This creates the calendar event. Do not call this speculatively — only "
+            "when the recipient has explicitly accepted a specific time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Meeting title, e.g. 'Catch-up with Alex'",
+                },
+                "startTime": {
+                    "type": "string",
+                    "description": "ISO 8601 start time, e.g. 2026-04-25T14:00:00",
+                },
+                "endTime": {
+                    "type": "string",
+                    "description": "ISO 8601 end time, e.g. 2026-04-25T15:00:00",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief meeting description",
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses of all attendees",
+                },
+            },
+            "required": ["summary", "startTime", "endTime", "attendees"],
         },
     },
 }
@@ -128,7 +173,8 @@ def _request_node_with_retries(
     refreshed_once = False
 
     for attempt in range(1, max_attempts + 1):
-        headers = {"g-axs-tk": token} if provider == "google" else {"o-axs-tk": token}
+        accounts_json = json.dumps([{"provider": provider, "token": token}])
+        headers = {"x-accounts": accounts_json}
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
@@ -322,7 +368,7 @@ def generate_initial_email(
         "Respond with SUBJECT: on first line, blank line, then body only."
     )
     response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
@@ -443,9 +489,12 @@ def find_conflicting_event(
     event_data: dict[str, Any],
     provider: str = "google",
     refresh_access_token: Callable[[], str | None] | None = None,
+    user_timezone: str | None = None,
+    user_timezone_offset_minutes: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Return the first conflicting event if overlap exists, else None.
+    startLocal/endLocal on the returned event are localized to the user's timezone.
     """
     start_dt = _parse_iso_datetime(str(event_data.get("startTime", "")))
     end_dt = _parse_iso_datetime(str(event_data.get("endTime", "")))
@@ -462,6 +511,8 @@ def find_conflicting_event(
         time_max=query_max,
         max_results=50,
         refresh_access_token=refresh_access_token,
+        user_timezone=user_timezone,
+        user_timezone_offset_minutes=user_timezone_offset_minutes,
     )
     for ev in events:
         ev_start = _parse_iso_datetime(ev.get("start"))
@@ -482,16 +533,32 @@ def generate_scheduling_reply(
     refresh_access_token: Callable[[], str | None] | None = None,
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
+    turn_count: int = 0,
 ) -> tuple[str, dict[str, Any] | None]:
     """
-    Tool-calling LLM loop (matches email-poc generate_reply):
-    1. LLM decides to call get_calendar_events with a time range
-    2. We fetch events and return them
-    3. LLM reasons over availability and writes the email reply
+    Tool-calling LLM loop:
+    1. LLM may call get_calendar_events to check availability
+    2. LLM may call finalize_meeting when both parties agree on a time
+    3. LLM writes the email reply body
     Returns (reply_body, finalized_event_dict_or_None).
     """
     client = _openai_client()
-    system = SYSTEM_PROMPT.format(sender_name=sender_name)
+
+    turn_context = ""
+    if turn_count >= 10:
+        turn_context = (
+            "\nURGENT: This thread has gone on for many turns without booking. "
+            "If ANY time was discussed and loosely agreed upon, call finalize_meeting NOW. "
+            "Otherwise send a brief closing note offering to resume when they have availability.\n"
+        )
+    elif turn_count >= 6:
+        turn_context = (
+            "\nNOTE: This conversation has been going on for several turns. "
+            "If a time has been discussed and accepted, call finalize_meeting immediately. "
+            "If not, propose fresh 4-5 slots and ask for a direct yes/no.\n"
+        )
+
+    system = SYSTEM_PROMPT.format(sender_name=sender_name, turn_context=turn_context)
     thread_display = "\n---\n".join(thread_messages) if thread_messages else "(no prior messages)"
     timezone_line = "unknown timezone"
     if user_timezone:
@@ -505,7 +572,8 @@ def generate_scheduling_reply(
         "Full email thread (oldest to newest):\n"
         f"{thread_display}\n\n"
         "Check the calendar for availability then write the next reply to move towards finalizing a meeting time. "
-        "When proposing times, use recipient-local phrasing and avoid UTC notation."
+        "When proposing times, use recipient-local phrasing and avoid UTC notation. "
+        "If the recipient has already agreed to a time, call finalize_meeting immediately."
     )
 
     messages: list[dict[str, Any]] = [
@@ -513,54 +581,91 @@ def generate_scheduling_reply(
         {"role": "user", "content": user_prompt},
     ]
 
-    while True:
+    all_tools = [GET_EVENTS_TOOL, FINALIZE_MEETING_TOOL]
+    max_iterations = 5
+    iteration = 0
+    finalized_payload: dict[str, Any] | None = None
+
+    while iteration < max_iterations:
+        iteration += 1
         response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=messages,
-            tools=[GET_EVENTS_TOOL],
+            tools=all_tools,
             tool_choice="auto",
         )
         msg = response.choices[0].message
 
         if not msg.tool_calls:
             content = (msg.content or "").strip()
-            body, finalized = _extract_finalized(content)
+            body, text_finalized = _extract_finalized(content)
+            if text_finalized and not finalized_payload:
+                finalized_payload = text_finalized
+
             if not body:
                 body = (
-                    "Thanks for the update. I can help finalize scheduling - "
-                    "please confirm your preferred time slot."
+                    "Thanks for the update — could you confirm which time slot "
+                    "works best for you?"
                 )
-            # Avoid repetitive greetings in ongoing turns.
-            lines = body.split("\n")
-            while lines and not lines[0].strip():
-                lines = lines[1:]
-            if lines and lines[0].strip().lower().startswith(("hi ", "hello ", "dear ")):
-                lines = lines[1:]
-                while lines and not lines[0].strip():
-                    lines = lines[1:]
-                body = "\n".join(lines).strip()
-            return body, finalized
+            body = _strip_leading_greeting(body)
+            return body, finalized_payload
 
         messages.append(msg.model_dump(exclude_none=True))
 
         for tc in msg.tool_calls:
-            if tc.function.name != "get_calendar_events":
-                continue
+            fn_name = tc.function.name
             args = json.loads(tc.function.arguments or "{}")
-            events = _get_calendar_events(
-                access_token=access_token,
-                provider=provider,
-                time_min=args.get("timeMin", ""),
-                time_max=args.get("timeMax", ""),
-                max_results=int(args.get("maxResults", 20)),
-                refresh_access_token=refresh_access_token,
-                user_timezone=user_timezone,
-                user_timezone_offset_minutes=user_timezone_offset_minutes,
-            )
-            messages.append(
-                {
+
+            if fn_name == "get_calendar_events":
+                events = _get_calendar_events(
+                    access_token=access_token,
+                    provider=provider,
+                    time_min=args.get("timeMin", ""),
+                    time_max=args.get("timeMax", ""),
+                    max_results=int(args.get("maxResults", 20)),
+                    refresh_access_token=refresh_access_token,
+                    user_timezone=user_timezone,
+                    user_timezone_offset_minutes=user_timezone_offset_minutes,
+                )
+                messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": json.dumps(events),
-                }
-            )
+                })
+
+            elif fn_name == "finalize_meeting":
+                finalized_payload = args
+                log_event(
+                    "llm_finalize_meeting_tool_called",
+                    summary=args.get("summary"),
+                    start=args.get("startTime"),
+                    end=args.get("endTime"),
+                    iteration=iteration,
+                )
+                # Return immediately -- don't loop back to the LLM for a
+                # prose confirmation. The push handler sends the final
+                # confirmation message after creating the calendar event.
+                return "", finalized_payload
+
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({"error": f"Unknown tool: {fn_name}"}),
+                })
+
+    log_event("generate_scheduling_reply_max_iterations", max_iterations=max_iterations)
+    return "Could you confirm the time that works best? I want to make sure we get this booked.", finalized_payload
+
+
+def _strip_leading_greeting(body: str) -> str:
+    """Remove repetitive greetings from ongoing thread replies."""
+    lines = body.split("\n")
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    if lines and lines[0].strip().lower().startswith(("hi ", "hello ", "dear ")):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+        return "\n".join(lines).strip() or body
+    return body

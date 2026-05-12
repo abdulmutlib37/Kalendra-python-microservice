@@ -41,6 +41,20 @@ from app.repository import (
 )
 from app.token_manager import TokenManager
 
+def _format_event_time(iso_str: str) -> str:
+    """Format an ISO 8601 datetime into a human-friendly string like 'Thursday, April 24 at 9:00 PM'."""
+    if not iso_str:
+        return "the agreed time"
+    try:
+        raw = iso_str.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        return dt.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
+    except Exception:
+        return iso_str
+
+
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 OUTLOOK_API_BASE = "https://graph.microsoft.com/v1.0"
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
@@ -366,6 +380,25 @@ def _get_message_metadata(
     }
 
 
+def _extract_text_body(payload: dict) -> str:
+    """Walk a Gmail MIME payload tree and return the text/plain body."""
+    mime_type = payload.get("mimeType", "")
+    if mime_type == "text/plain":
+        data = (payload.get("body") or {}).get("data", "")
+        if data:
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+        return ""
+
+    for part in payload.get("parts") or []:
+        text = _extract_text_body(part)
+        if text:
+            return text
+    return ""
+
+
 def _get_thread_messages_for_agent(
     token: str,
     thread_id: str,
@@ -376,7 +409,7 @@ def _get_thread_messages_for_agent(
         "GET",
         f"/threads/{thread_id}",
         refresh_access_token=refresh_access_token,
-        params={"format": "metadata", "metadataHeaders": ["From", "Subject"]},
+        params={"format": "full"},
     )
     if resp.status_code != 200:
         log_event("gmail_thread_fetch_failed", thread_id=thread_id, status_code=resp.status_code)
@@ -387,38 +420,30 @@ def _get_thread_messages_for_agent(
         payload = m.get("payload", {})
         headers = {h.get("name", ""): h.get("value", "") for h in payload.get("headers", [])}
         sender = headers.get("From", "Unknown")
-        snippet = (m.get("snippet") or "").strip()
-        if snippet:
-            messages.append(f"From: {sender}\n{snippet}")
+
+        body = _extract_text_body(payload).strip()
+        if not body:
+            body = (m.get("snippet") or "").strip()
+        if body:
+            messages.append(f"From: {sender}\n{body[:800]}")
     return messages
 
 
-def _is_finalization_confident(thread_messages: list[str]) -> bool:
+def _has_explicit_rejection(thread_messages: list[str]) -> bool:
     """
-    Prevent premature closure when the model emits FINALIZED too early.
-    We require explicit acceptance language plus a concrete time/day signal
-    in the latest inbound content.
+    Lightweight safety veto: block finalization only when the latest inbound
+    message contains a clear cancellation or rejection signal.
     """
     if not thread_messages:
         return False
     latest = (thread_messages[-1] or "").lower()
-    has_acceptance = bool(
-        re.search(r"\b(yes|confirmed|confirm|works for me|that works|sounds good|see you|agreed|perfect)\b", latest)
-    )
-    latest_time_signal = bool(
+    return bool(
         re.search(
-            r"\b(\d{1,2}(:\d{2})?\s?(am|pm)|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|utc|gmt)\b",
+            r"\b(cancel|never mind|don'?t book|wrong time|actually no|not that time|"
+            r"hold off|stop|don'?t schedule|changed my mind|reschedule|pick another)\b",
             latest,
         )
     )
-    recent_context = "\n".join((thread_messages or [])[-4:]).lower()
-    recent_time_signal = bool(
-        re.search(
-            r"\b(\d{1,2}(:\d{2})?\s?(am|pm)|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|utc|gmt)\b",
-            recent_context,
-        )
-    )
-    return has_acceptance and (latest_time_signal or recent_time_signal)
 
 
 def _latest_message_allows_conflict(thread_messages: list[str]) -> bool:
@@ -427,7 +452,10 @@ def _latest_message_allows_conflict(thread_messages: list[str]) -> bool:
     latest = (thread_messages[-1] or "").lower()
     return bool(
         re.search(
-            r"\b(book it anyway|schedule anyway|still book|still schedule|conflict is fine|i am okay with conflict|go ahead anyway)\b",
+            r"\b(book it anyway|schedule anyway|still book|still schedule|conflict is fine|"
+            r"i am okay with conflict|go ahead anyway|go ahead|do it|book it|yes|sure|"
+            r"that('?s| is) fine|okay|ok|no problem|that works|works for me|"
+            r"you can do it|please do|proceed|confirm it|lock it in)\b",
             latest,
         )
     )
@@ -1066,6 +1094,41 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
         if not convo:
             continue
 
+        guardrail_text = _guardrail_override_reply(convo)
+        if guardrail_text:
+            reply_resp = _request_outlook(
+                token, "POST", f"/me/messages/{message_id}/reply",
+                refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+                json={"comment": guardrail_text},
+            )
+            if reply_resp.status_code in (200, 202):
+                replied += 1
+                save_thread(thread_doc_id, {
+                    "gmail_thread_id": thread_id, "status": "active", "state": "open",
+                    "turn_count": turn_count + 1, "last_message_id": message_id,
+                    "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+                    "conversation_messages": (convo + [f"From: {user_email}\n{guardrail_text}"])[-30:],
+                })
+            continue
+
+        if turn_count >= 10:
+            closing_text = (
+                "It seems we're having trouble finding a time. Feel free to reply "
+                "whenever you have a slot that works, and I'll get it booked right away."
+            )
+            reply_resp = _request_outlook(
+                token, "POST", f"/me/messages/{message_id}/reply",
+                refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+                json={"comment": closing_text},
+            )
+            if reply_resp.status_code in (200, 202):
+                replied += 1
+                save_thread(thread_doc_id, {
+                    "turn_count": turn_count + 1, "last_message_id": message_id,
+                    "conversation_messages": (convo + [f"From: {user_email}\n{closing_text}"])[-30:],
+                })
+            continue
+
         reply_text, finalized_payload = generate_scheduling_reply(
             thread_messages=convo,
             access_token=token,
@@ -1075,15 +1138,14 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
             refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
             user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
             user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
+            turn_count=turn_count,
         )
-        if not reply_text:
+        # Empty reply_text is expected when finalize_meeting tool was called --
+        # the finalization block below handles event creation and sends confirmation.
+        if not reply_text and not finalized_payload:
             continue
-        guardrail_text = _guardrail_override_reply(convo)
-        if guardrail_text:
-            reply_text = guardrail_text
-            finalized_payload = None
 
-        if finalized_payload and _is_finalization_confident(convo):
+        if finalized_payload and not _has_explicit_rejection(convo):
             finalized_payload = normalize_finalized_event_times(
                 finalized_payload,
                 user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
@@ -1094,42 +1156,18 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
                 event_data=finalized_payload,
                 provider="outlook",
                 refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+                user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+                user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
             )
             if conflict and not _latest_message_allows_conflict(convo):
-                conflict_title = conflict.get("summary") or "another meeting"
-                conflict_start = conflict.get("startLocal") or conflict.get("start") or "that time"
+                raw_start = conflict.get("startLocal") or conflict.get("start") or ""
+                conflict_start = _format_event_time(raw_start) if raw_start else "that time"
                 reply_text = (
-                    f"I noticed a calendar conflict with {conflict_title} around {conflict_start}. "
-                    "Would you like me to pick another slot, or should I book this anyway?"
+                    f"I have a conflict at {conflict_start}. "
+                    "Should I book this anyway, or would you prefer a different slot?"
                 )
                 finalized_payload = None
-
-        reply_resp = _request_outlook(
-            token,
-            "POST",
-            f"/me/messages/{message_id}/reply",
-            refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
-            json={"comment": reply_text},
-        )
-        if reply_resp.status_code not in (200, 202):
-            continue
-        replied += 1
-
-        save_thread(
-            thread_doc_id,
-            {
-                "gmail_thread_id": thread_id,
-                "status": "active",
-                "state": "open",
-                "turn_count": turn_count + 1,
-                "last_message_id": message_id,
-                "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
-                "conversation_messages": (convo + [f"From: {user_email}\n{reply_text}"])[-30:],
-            },
-        )
-
-        if finalized_payload:
-            if _is_finalization_confident(convo):
+            else:
                 existing_attendees = finalized_payload.get("attendees") or []
                 normalized = {
                     str(a).strip().lower()
@@ -1139,19 +1177,48 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
                 normalized.update({user_email.lower(), from_email.lower()})
                 finalized_payload["attendees"] = sorted(normalized)
                 create_result = create_calendar_event(
-                    token,
-                    finalized_payload,
-                    provider="outlook",
+                    token, finalized_payload, provider="outlook",
                     refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
                 )
                 if create_result.get("ok"):
+                    friendly_time = _format_event_time(finalized_payload.get("startTime", ""))
+                    confirm_text = (
+                        f"All set! We're confirmed for {friendly_time}. "
+                        "A calendar invite is on its way to you."
+                    )
+                    _request_outlook(
+                        token, "POST", f"/me/messages/{message_id}/reply",
+                        refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+                        json={"comment": confirm_text},
+                    )
                     delete_thread(thread_doc_id)
                     finalized += 1
+                    replied += 1
                     log_event("thread_finalized", thread_doc_id=thread_doc_id, provider="outlook")
+                    continue
                 else:
                     log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, provider="outlook", error=create_result.get("error"))
-            else:
-                log_event("thread_finalize_skipped_low_confidence", thread_doc_id=thread_doc_id, provider="outlook")
+                    reply_text = (
+                        "I tried to book the meeting but ran into a technical issue. "
+                        "Let me try again shortly — no action needed on your end."
+                    )
+                    finalized_payload = None
+
+        reply_resp = _request_outlook(
+            token, "POST", f"/me/messages/{message_id}/reply",
+            refresh_access_token=lambda: token_manager.get_fresh_token(user_email, "outlook"),
+            json={"comment": reply_text},
+        )
+        if reply_resp.status_code not in (200, 202):
+            continue
+        replied += 1
+
+        save_thread(thread_doc_id, {
+            "gmail_thread_id": thread_id, "status": "active", "state": "open",
+            "turn_count": turn_count + 1, "last_message_id": message_id,
+            "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+            "conversation_messages": (convo + [f"From: {user_email}\n{reply_text}"])[-30:],
+        })
 
     return {"ok": True, "data": {"replied_count": replied, "finalized_count": finalized}}
 
@@ -1323,6 +1390,44 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 )
                 if not convo:
                     continue
+
+                guardrail_text = _guardrail_override_reply(convo)
+                if guardrail_text:
+                    sent = _send_agent_reply(
+                        token=token, user_email=email_address, to_email=from_email,
+                        subject=meta.get("subject", "Re:"), body=guardrail_text,
+                        thread_id=thread_id, parent_message_id=meta.get("message_id_header", ""),
+                        refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                    )
+                    if sent:
+                        replied += 1
+                        save_thread(thread_doc_id, {
+                            "gmail_thread_id": thread_id, "status": "active", "state": "open",
+                            "turn_count": turn_count + 1, "last_message_id": msg_id,
+                            "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+                        })
+                    processed_items += 1
+                    continue
+
+                if turn_count >= 10:
+                    closing_text = (
+                        "It seems we're having trouble finding a time. Feel free to reply "
+                        "whenever you have a slot that works, and I'll get it booked right away."
+                    )
+                    sent = _send_agent_reply(
+                        token=token, user_email=email_address, to_email=from_email,
+                        subject=meta.get("subject", "Re:"), body=closing_text,
+                        thread_id=thread_id, parent_message_id=meta.get("message_id_header", ""),
+                        refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                    )
+                    if sent:
+                        replied += 1
+                        save_thread(thread_doc_id, {
+                            "turn_count": turn_count + 1, "last_message_id": msg_id,
+                        })
+                    processed_items += 1
+                    continue
+
                 reply_text, finalized_payload = generate_scheduling_reply(
                     thread_messages=convo,
                     access_token=token,
@@ -1332,15 +1437,14 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
                     user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
                     user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
+                    turn_count=turn_count,
                 )
-                if not reply_text:
+                # Empty reply_text is expected when finalize_meeting tool was called --
+                # the finalization block below handles event creation and sends confirmation.
+                if not reply_text and not finalized_payload:
                     continue
-                guardrail_text = _guardrail_override_reply(convo)
-                if guardrail_text:
-                    reply_text = guardrail_text
-                    finalized_payload = None
 
-                if finalized_payload and _is_finalization_confident(convo):
+                if finalized_payload and not _has_explicit_rejection(convo):
                     finalized_payload = normalize_finalized_event_times(
                         finalized_payload,
                         user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
@@ -1351,44 +1455,18 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                         event_data=finalized_payload,
                         provider="google",
                         refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                        user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+                        user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
                     )
                     if conflict and not _latest_message_allows_conflict(convo):
-                        conflict_title = conflict.get("summary") or "another meeting"
-                        conflict_start = conflict.get("startLocal") or conflict.get("start") or "that time"
+                        raw_start = conflict.get("startLocal") or conflict.get("start") or ""
+                        conflict_start = _format_event_time(raw_start) if raw_start else "that time"
                         reply_text = (
-                            f"I noticed a calendar conflict with {conflict_title} around {conflict_start}. "
-                            "Would you like me to pick another slot, or should I book this anyway?"
+                            f"I have a conflict at {conflict_start}. "
+                            "Should I book this anyway, or would you prefer a different slot?"
                         )
                         finalized_payload = None
-
-                sent = _send_agent_reply(
-                    token=token,
-                    user_email=email_address,
-                    to_email=from_email,
-                    subject=meta.get("subject", "Re:"),
-                    body=reply_text,
-                    thread_id=thread_id,
-                    parent_message_id=meta.get("message_id_header", ""),
-                    refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
-                )
-                if not sent:
-                    continue
-
-                replied += 1
-                save_thread(
-                    thread_doc_id,
-                    {
-                        "gmail_thread_id": thread_id,
-                        "status": "active",
-                        "state": "open",
-                        "turn_count": turn_count + 1,
-                        "last_message_id": msg_id,
-                        "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
-                    },
-                )
-
-                if finalized_payload:
-                    if _is_finalization_confident(convo):
+                    else:
                         existing_attendees = finalized_payload.get("attendees") or []
                         normalized = {
                             str(a).strip().lower()
@@ -1398,19 +1476,50 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                         normalized.update({email_address.lower(), from_email.lower()})
                         finalized_payload["attendees"] = sorted(normalized)
                         create_result = create_calendar_event(
-                            token,
-                            finalized_payload,
-                            provider="google",
+                            token, finalized_payload, provider="google",
                             refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
                         )
                         if create_result.get("ok"):
+                            friendly_time = _format_event_time(finalized_payload.get("startTime", ""))
+                            confirm_text = (
+                                f"All set! We're confirmed for {friendly_time}. "
+                                "A calendar invite is on its way to you."
+                            )
+                            _send_agent_reply(
+                                token=token, user_email=email_address, to_email=from_email,
+                                subject=meta.get("subject", "Re:"), body=confirm_text,
+                                thread_id=thread_id, parent_message_id=meta.get("message_id_header", ""),
+                                refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                            )
                             delete_thread(thread_doc_id)
                             finalized += 1
+                            replied += 1
                             log_event("thread_finalized", thread_doc_id=thread_doc_id)
+                            processed_items += 1
+                            continue
                         else:
                             log_event("thread_finalize_create_event_failed", thread_doc_id=thread_doc_id, error=create_result.get("error"))
-                    else:
-                        log_event("thread_finalize_skipped_low_confidence", thread_doc_id=thread_doc_id)
+                            reply_text = (
+                                "I tried to book the meeting but ran into a technical issue. "
+                                "Let me try again shortly — no action needed on your end."
+                            )
+                            finalized_payload = None
+
+                sent = _send_agent_reply(
+                    token=token, user_email=email_address, to_email=from_email,
+                    subject=meta.get("subject", "Re:"), body=reply_text,
+                    thread_id=thread_id, parent_message_id=meta.get("message_id_header", ""),
+                    refresh_access_token=lambda: token_manager.get_fresh_token(email_address, "google"),
+                )
+                if not sent:
+                    continue
+
+                replied += 1
+                save_thread(thread_doc_id, {
+                    "gmail_thread_id": thread_id, "status": "active", "state": "open",
+                    "turn_count": turn_count + 1, "last_message_id": msg_id,
+                    "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+                })
                 processed_items += 1
             except Exception as exc:
                 # Never fail whole webhook batch due to a single bad message.
