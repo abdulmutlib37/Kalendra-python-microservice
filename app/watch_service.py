@@ -489,7 +489,7 @@ def _is_sensitive_calendar_data_request(text: str) -> bool:
         return False
     return bool(
         re.search(
-            r"\b(what is your calendar like|who is in your meeting|who all|last time you met|last meeting with|all bookings|share your calendar|meeting with)\b",
+            r"\b(who is in your meeting|last meeting with|all bookings|share your calendar)\b",
             t,
         )
     )

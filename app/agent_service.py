@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -19,10 +20,18 @@ from app.logging_config import log_event
 
 NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "http://localhost:8080")
 FINALIZED_MARKER = "##FINALIZED##"
+EMAIL_FORMAT_STYLE = (
+    "FORMAT STYLE:\n"
+    "- Use consistent paragraphing: no first-line indentation, no leading spaces, and one blank line between paragraphs.\n"
+    "- If listing multiple time options, use a simple vertical list with one item per line using '- ' bullets.\n"
+    "- Do not mix paragraph lists, numbered lists, and indented bullets in the same reply.\n"
+    "- Keep the format natural to the message; do not force a list when a short paragraph is clearer.\n\n"
+)
 
 SYSTEM_PROMPT = (
     "You are Kalendra, a scheduling assistant acting on behalf of {sender_name}.\n"
     "Your sole job is to find a mutually convenient meeting time with the recipient and book it.\n\n"
+    f"{EMAIL_FORMAT_STYLE}"
     "SECURITY:\n"
     "- Only discuss scheduling. Refuse unrelated questions and steer back.\n"
     "- Never reveal full calendar details, contact lists, or internal info.\n"
@@ -128,20 +137,26 @@ FINALIZE_MEETING_TOOL = {
 INITIAL_EMAIL_SYSTEM_PROMPT = (
     "You are Kalendra, a warm and professional scheduling assistant acting on behalf of {sender_name}.\n"
     "Your goal is to write the first outbound email to initiate scheduling a meeting with the recipient.\n\n"
+    f"{EMAIL_FORMAT_STYLE}"
     "**Email Structure (REQUIRED)**:\n"
     "1. Greeting (e.g., 'Hi [Name],')\n"
-    "2. Brief context about the meeting purpose (1-2 sentences, naturally integrated from context)\n"
-    "3. Ask for their availability/free time (e.g., 'Could you share your availability for next week?')\n"
-    "4. Friendly closing question (e.g., 'What times work best for you?')\n"
-    "5. Sign-off with 'Best regards,' or 'Thanks,' followed by {sender_name}\n"
-    "6. ALWAYS end with a blank line, then: 'Email Scheduling - Powered by Kalendra'\n\n"
+    "2. A clear scheduling-intent sentence in natural language (state that you'd like to schedule a meeting, adapted to context)\n"
+    "3. Brief context about the meeting purpose (1-2 sentences, naturally integrated from context)\n"
+    "4. Ask for their availability/free time (e.g., 'Could you share your availability for next week?')\n"
+    "5. Friendly closing question (e.g., 'What times work best for you?')\n"
+    "6. Sign-off with 'Best regards,' or 'Thanks,' followed by {sender_name}\n"
+    "7. ALWAYS end with a blank line, then: 'Email Scheduling - Powered by Kalendra'\n\n"
     "Guidelines:\n"
     "- Be warm, professional, and natural - write like a thoughtful human assistant\n"
     "- Keep the email 4-6 sentences (not too short, not too long)\n"
+    "- The body must be at least 2 short paragraphs, separated by one blank line\n"
     "- Never mention you are an AI\n"
     "- Do not sign as Kalendra; sign off as {sender_name}\n"
     "- NEVER paste the context text verbatim as a standalone sentence - integrate it naturally\n"
-    "- Do not include subject lines or headers in the body\n\n"
+    "- Do not use awkward phrasing like 'I'd like to scheduling ...'; always write grammatical sentences\n"
+    "- If context includes wording like 'titled ...', treat that as subject intent, not body prose\n"
+    "- Do not include subject lines or headers in the body\n"
+    "- Keep the ordering strict: greeting first, scheduling intent early, then availability ask\n\n"
     "Respond with exactly two parts separated by a blank line:\n"
     "1. First line: SUBJECT: <your subject line>\n"
     "2. Remaining lines: The email body (greeting, context, availability ask, closing, sign-off, Kalendra signature)."
@@ -353,6 +368,7 @@ def generate_initial_email(
     sender_name: str,
     recipient_name: str,
     context: str,
+    preferred_subject: str | None = None,
 ) -> tuple[str, str]:
     """
     Generate the first outbound email (subject + body) via LLM.
@@ -360,11 +376,19 @@ def generate_initial_email(
     """
     client = _openai_client()
     system = INITIAL_EMAIL_SYSTEM_PROMPT.format(sender_name=sender_name)
+    preferred_subject_text = (preferred_subject or "").strip()
+    subject_instruction = (
+        f'Use this exact subject text with unchanged wording and casing: "{preferred_subject_text}".'
+        if preferred_subject_text
+        else "Create a concise, natural subject based on the context."
+    )
     user_msg = (
         f"Context: {context}\n\n"
         f"Recipient name: {recipient_name or 'there'}\n\n"
+        f"Subject instruction: {subject_instruction}\n\n"
         "Write the first scheduling email in email-poc style. "
         "Personalize naturally from context, but do not copy instruction-like wording. "
+        "Follow the required structure exactly: greeting first, then scheduling intent, then availability ask. "
         "Respond with SUBJECT: on first line, blank line, then body only."
     )
     response = client.chat.completions.create(
@@ -377,17 +401,18 @@ def generate_initial_email(
     content = (response.choices[0].message.content or "").strip()
     if not content:
         raise ValueError("LLM returned empty initial email")
-
     lines = content.split("\n")
-    subject = "Meeting Request"
+    subject = preferred_subject_text or "Meeting Request"
     body_start = 0
     for i, line in enumerate(lines):
         if line.strip().upper().startswith("SUBJECT:"):
             subject = line.split(":", 1)[-1].strip()
             if not subject:
-                subject = "Meeting Request"
+                subject = preferred_subject_text or "Meeting Request"
             body_start = i + 1
             break
+    if preferred_subject_text:
+        subject = preferred_subject_text
     body_lines = lines[body_start:]
     body = "\n".join(body_lines).strip()
     # Guardrails: body must not repeat Subject/title line.
@@ -398,10 +423,40 @@ def generate_initial_email(
         body_clean_lines = body_clean_lines[1:]
     if body_clean_lines and subject and body_clean_lines[0].strip().lower() == subject.strip().lower():
         body_clean_lines = body_clean_lines[1:]
-    body = "\n".join(body_clean_lines).strip()
+    body = _normalize_email_body_format("\n".join(body_clean_lines))
     if not body:
         raise ValueError("LLM returned no email body")
     return subject, body
+
+
+def _normalize_email_body_format(body: str) -> str:
+    """
+    Normalize generated email layout without changing wording.
+    Keeps prose natural while making whitespace and list indentation stable.
+    """
+    if not body:
+        return ""
+
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    lines: list[str] = []
+    blank_pending = False
+
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            blank_pending = bool(lines)
+            continue
+
+        bullet_match = re.match(r"^(?:[-*]|\u2022|\d+[.)])\s+(.*)$", line)
+        if bullet_match:
+            line = f"- {bullet_match.group(1).strip()}"
+
+        if blank_pending and lines and lines[-1] != "":
+            lines.append("")
+        lines.append(line)
+        blank_pending = False
+
+    return "\n".join(lines).strip()
 
 
 def _extract_finalized(content: str) -> tuple[str, dict[str, Any] | None]:
@@ -608,6 +663,7 @@ def generate_scheduling_reply(
                     "works best for you?"
                 )
             body = _strip_leading_greeting(body)
+            body = _normalize_email_body_format(body)
             return body, finalized_payload
 
         messages.append(msg.model_dump(exclude_none=True))
@@ -655,7 +711,10 @@ def generate_scheduling_reply(
                 })
 
     log_event("generate_scheduling_reply_max_iterations", max_iterations=max_iterations)
-    return "Could you confirm the time that works best? I want to make sure we get this booked.", finalized_payload
+    fallback_body = _normalize_email_body_format(
+        "Could you confirm the time that works best? I want to make sure we get this booked."
+    )
+    return fallback_body, finalized_payload
 
 
 def _strip_leading_greeting(body: str) -> str:

@@ -373,6 +373,7 @@ async def generate_email_draft_endpoint(
     sender_name: str = Body(...),
     recipient_name: str = Body(...),
     context: str = Body(...),
+    preferred_subject: str | None = Body(default=None),
 ):
     """
     Generate email draft (subject + body) for preview in confirmation dialog.
@@ -382,6 +383,7 @@ async def generate_email_draft_endpoint(
             sender_name=sender_name,
             recipient_name=recipient_name or "there",
             context=context or "schedule a meeting",
+            preferred_subject=preferred_subject,
         )
         return {"subject": subject, "body": body}
     except Exception as exc:
