@@ -1,16 +1,3 @@
-"""
-FCM push notification service for the Kalendra email scheduling flow.
-
-Reads the user's FCM device token from Firestore (stored by the Flutter app)
-and sends notifications via Firebase Admin SDK messaging.
-
-Two notification types:
-  - send_flow_update: "There has been development in your email scheduling flow"
-    Triggered after every successful agent reply (not the initial email).
-  - send_flow_completed: "Your email scheduling flow has been successfully completed"
-    Triggered after the meeting is booked and the thread is finalized.
-"""
-
 from __future__ import annotations
 
 import os
@@ -25,7 +12,6 @@ FCM_TOKENS_COLLECTION = os.getenv("FCM_TOKENS_COLLECTION", "fcm_tokens")
 
 
 def _get_fcm_token(user_email: str) -> str | None:
-    """Retrieve the stored FCM device token for a user."""
     try:
         doc = get_db().collection(FCM_TOKENS_COLLECTION).document(user_email.lower().strip()).get()
         if not doc.exists:
@@ -43,7 +29,6 @@ def _get_fcm_token(user_email: str) -> str | None:
 
 
 def _send_fcm(token: str, title: str, body: str, data: dict[str, str] | None = None) -> bool:
-    """Send an FCM message to a single device token."""
     try:
         message = fcm_messaging.Message(
             notification=fcm_messaging.Notification(title=title, body=body),
@@ -69,65 +54,35 @@ def _send_fcm(token: str, title: str, body: str, data: dict[str, str] | None = N
         return False
 
 
-def send_flow_update(
-    user_email: str,
-    recipient_name: str,
-    recipient_email: str,
-) -> None:
-    """
-    Send "There has been development in your email scheduling flow" notification.
-    Called after each successful agent reply (skipping the initial outbound email).
-    """
+def send_flow_update(user_email: str, recipient_name: str, recipient_email: str, meeting_title: str = "") -> None:
     token = _get_fcm_token(user_email)
     if not token:
         return
-
     name_display = (recipient_name or "").strip() or recipient_email
-    body = (
-        f"Recipient Name: {name_display}\n"
-        f"Recipient Email: {recipient_email}"
-    )
+    title = (meeting_title or "").strip()
+    body = f"Kalendra has replied to \"{title}\"" if title else "Kalendra has replied"
     sent = _send_fcm(
         token=token,
-        title="There has been development in your email scheduling flow",
+        title=name_display,
         body=body,
-        data={
-            "type": "email_flow_update",
-            "recipient_name": name_display,
-            "recipient_email": recipient_email,
-        },
+        data={"type": "email_flow_update", "recipient_name": name_display, "meeting_title": title, "sender_email": user_email.lower()},
     )
     if sent:
         log_event("fcm_flow_update_sent", user_email=user_email, recipient_email=recipient_email)
 
 
-def send_flow_completed(
-    user_email: str,
-    recipient_name: str,
-    recipient_email: str,
-) -> None:
-    """
-    Send "Your email scheduling flow has been successfully completed" notification.
-    Called after the meeting is booked and the Firestore thread is deleted/finalized.
-    """
+def send_flow_completed(user_email: str, recipient_name: str, recipient_email: str, meeting_title: str = "") -> None:
     token = _get_fcm_token(user_email)
     if not token:
         return
-
     name_display = (recipient_name or "").strip() or recipient_email
-    body = (
-        f"Recipient Name: {name_display}\n"
-        f"Recipient Email: {recipient_email}"
-    )
+    title = (meeting_title or "").strip()
+    body = f"Meeting \"{title}\" confirmed with {name_display}" if title else f"Meeting confirmed with {name_display}"
     sent = _send_fcm(
         token=token,
-        title="Your email scheduling flow has been successfully completed",
+        title="Meeting Confirmed",
         body=body,
-        data={
-            "type": "email_flow_completed",
-            "recipient_name": name_display,
-            "recipient_email": recipient_email,
-        },
+        data={"type": "email_flow_completed", "recipient_name": name_display, "meeting_title": title, "sender_email": user_email.lower()},
     )
     if sent:
         log_event("fcm_flow_completed_sent", user_email=user_email, recipient_email=recipient_email)

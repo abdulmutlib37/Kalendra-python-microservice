@@ -1,12 +1,7 @@
-"""
-LLM scheduling agent integration for email reply generation.
-"""
-
 from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -17,6 +12,8 @@ import httpx
 from openai import OpenAI
 
 from app.logging_config import log_event
+from app.utils.text_utils import normalize_email_body_format, strip_leading_greeting
+from app.utils.time_utils import parse_iso_datetime, local_tzinfo, normalize_finalized_event_times
 
 NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "http://localhost:8080")
 FINALIZED_MARKER = "##FINALIZED##"
@@ -77,18 +74,9 @@ GET_EVENTS_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "timeMin": {
-                    "type": "string",
-                    "description": "ISO 8601 datetime lower bound e.g. 2026-02-17T00:00:00Z",
-                },
-                "timeMax": {
-                    "type": "string",
-                    "description": "ISO 8601 datetime upper bound e.g. 2026-02-24T00:00:00Z",
-                },
-                "maxResults": {
-                    "type": "integer",
-                    "description": "Max number of events to return. Default 20.",
-                },
+                "timeMin": {"type": "string", "description": "ISO 8601 datetime lower bound e.g. 2026-02-17T00:00:00Z"},
+                "timeMax": {"type": "string", "description": "ISO 8601 datetime upper bound e.g. 2026-02-24T00:00:00Z"},
+                "maxResults": {"type": "integer", "description": "Max number of events to return. Default 20."},
             },
             "required": ["timeMin", "timeMax"],
         },
@@ -107,27 +95,11 @@ FINALIZE_MEETING_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Meeting title, e.g. 'Catch-up with Alex'",
-                },
-                "startTime": {
-                    "type": "string",
-                    "description": "ISO 8601 start time, e.g. 2026-04-25T14:00:00",
-                },
-                "endTime": {
-                    "type": "string",
-                    "description": "ISO 8601 end time, e.g. 2026-04-25T15:00:00",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Brief meeting description",
-                },
-                "attendees": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Email addresses of all attendees",
-                },
+                "summary": {"type": "string", "description": "Meeting title, e.g. 'Catch-up with Alex'"},
+                "startTime": {"type": "string", "description": "ISO 8601 start time, e.g. 2026-04-25T14:00:00"},
+                "endTime": {"type": "string", "description": "ISO 8601 end time, e.g. 2026-04-25T15:00:00"},
+                "description": {"type": "string", "description": "Brief meeting description"},
+                "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses of all attendees"},
             },
             "required": ["summary", "startTime", "endTime", "attendees"],
         },
@@ -195,12 +167,8 @@ def _request_node_with_retries(
 
         try:
             resp = httpx.request(
-                method=method,
-                url=f"{NODE_BACKEND_URL}{path}",
-                headers=headers,
-                params=params,
-                json=json_body,
-                timeout=20.0,
+                method=method, url=f"{NODE_BACKEND_URL}{path}",
+                headers=headers, params=params, json=json_body, timeout=20.0,
             )
         except Exception as exc:
             if attempt == max_attempts:
@@ -221,21 +189,12 @@ def _request_node_with_retries(
                 continue
             return {"ok": False, "error": f"{operation}_401_and_refresh_failed"}
 
-        if resp.status_code == 429 and attempt < max_attempts:
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
             time.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2, 8.0)
             continue
 
-        if resp.status_code >= 500 and attempt < max_attempts:
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 8.0)
-            continue
-
-        return {
-            "ok": False,
-            "error": f"{operation}_http_{resp.status_code}",
-            "response": resp.text[:500],
-        }
+        return {"ok": False, "error": f"{operation}_http_{resp.status_code}", "response": resp.text[:500]}
 
     return {"ok": False, "error": f"{operation}_exhausted_retries"}
 
@@ -250,62 +209,30 @@ def _get_calendar_events(
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
 ) -> list[dict]:
-    params = {
-        "timeMin": time_min,
-        "timeMax": time_max,
-        "maxResults": max_results,
-        "type": provider,
-        "includeTasks": "false",
-    }
+    params = {"timeMin": time_min, "timeMax": time_max, "maxResults": max_results,
+              "type": provider, "includeTasks": "false"}
     result = _request_node_with_retries(
-        method="GET",
-        path="/api/calendar/events",
-        access_token=access_token,
-        provider=provider,
-        params=params,
-        refresh_access_token=refresh_access_token,
+        method="GET", path="/api/calendar/events", access_token=access_token,
+        provider=provider, params=params, refresh_access_token=refresh_access_token,
         operation="agent_calendar_fetch",
     )
     if not result.get("ok"):
-        log_event(
-            "agent_calendar_fetch_failed",
-            error=result.get("error"),
-            response=result.get("response"),
-        )
+        log_event("agent_calendar_fetch_failed", error=result.get("error"), response=result.get("response"))
         return []
 
     payload = result["response"].json()
     events = payload.get("events", []) if isinstance(payload, dict) else []
     log_event("agent_calendar_fetch_success", event_count=len(events))
-    def _parse_iso(value: str | None) -> datetime | None:
-        if not value:
-            return None
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            if raw.endswith("Z"):
-                raw = raw[:-1] + "+00:00"
-            dt = datetime.fromisoformat(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            return None
+
+    tz = local_tzinfo(user_timezone, user_timezone_offset_minutes)
 
     def _localize(dt_value: str | None) -> str | None:
-        dt = _parse_iso(dt_value)
+        dt = parse_iso_datetime(dt_value)
         if not dt:
             return None
-        if user_timezone:
+        if tz:
             try:
-                return dt.astimezone(ZoneInfo(user_timezone)).strftime("%a, %b %d, %I:%M %p")
-            except Exception:
-                pass
-        if user_timezone_offset_minutes is not None:
-            try:
-                local_dt = dt + timedelta(minutes=int(user_timezone_offset_minutes))
-                return local_dt.strftime("%a, %b %d, %I:%M %p")
+                return dt.astimezone(tz).strftime("%a, %b %d, %I:%M %p")
             except Exception:
                 pass
         return dt.astimezone(timezone.utc).strftime("%a, %b %d, %I:%M %p UTC")
@@ -316,15 +243,13 @@ def _get_calendar_events(
         end_obj = e.get("end") or {}
         start_value = start_obj.get("dateTime") or start_obj.get("date")
         end_value = end_obj.get("dateTime") or end_obj.get("date")
-        slim.append(
-            {
-                "summary": e.get("summary", "Busy"),
-                "start": start_value,
-                "end": end_value,
-                "startLocal": _localize(start_value),
-                "endLocal": _localize(end_value),
-            }
-        )
+        slim.append({
+            "summary": e.get("summary", "Busy"),
+            "start": start_value,
+            "end": end_value,
+            "startLocal": _localize(start_value),
+            "endLocal": _localize(end_value),
+        })
     return slim
 
 
@@ -343,25 +268,15 @@ def create_calendar_event(
         "type": provider,
     }
     result = _request_node_with_retries(
-        method="POST",
-        path="/api/calendar/events",
-        access_token=access_token,
-        provider=provider,
-        params={"type": provider},
-        json_body=body,
-        refresh_access_token=refresh_access_token,
-        operation="agent_create_event",
+        method="POST", path="/api/calendar/events", access_token=access_token,
+        provider=provider, params={"type": provider}, json_body=body,
+        refresh_access_token=refresh_access_token, operation="agent_create_event",
     )
     if not result.get("ok"):
-        log_event(
-            "agent_create_event_failed",
-            error=result.get("error"),
-            response=result.get("response"),
-        )
+        log_event("agent_create_event_failed", error=result.get("error"), response=result.get("response"))
         return {"ok": False, "error": result.get("error"), "response": result.get("response")}
-    created_payload = result["response"].json()
     log_event("agent_create_event_success")
-    return {"ok": True, "data": created_payload}
+    return {"ok": True, "data": result["response"].json()}
 
 
 def generate_initial_email(
@@ -370,10 +285,6 @@ def generate_initial_email(
     context: str,
     preferred_subject: str | None = None,
 ) -> tuple[str, str]:
-    """
-    Generate the first outbound email (subject + body) via LLM.
-    Returns (subject, body). No hardcoded templates.
-    """
     client = _openai_client()
     system = INITIAL_EMAIL_SYSTEM_PROMPT.format(sender_name=sender_name)
     preferred_subject_text = (preferred_subject or "").strip()
@@ -393,146 +304,46 @@ def generate_initial_email(
     )
     response = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_msg},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
     )
     content = (response.choices[0].message.content or "").strip()
     if not content:
         raise ValueError("LLM returned empty initial email")
+
     lines = content.split("\n")
     subject = preferred_subject_text or "Meeting Request"
     body_start = 0
     for i, line in enumerate(lines):
         if line.strip().upper().startswith("SUBJECT:"):
-            subject = line.split(":", 1)[-1].strip()
-            if not subject:
-                subject = preferred_subject_text or "Meeting Request"
+            subject = line.split(":", 1)[-1].strip() or subject
             body_start = i + 1
             break
     if preferred_subject_text:
         subject = preferred_subject_text
+
     body_lines = lines[body_start:]
     body = "\n".join(body_lines).strip()
-    # Guardrails: body must not repeat Subject/title line.
-    body_clean_lines = [ln for ln in body.split("\n")]
-    while body_clean_lines and not body_clean_lines[0].strip():
-        body_clean_lines.pop(0)
-    if body_clean_lines and body_clean_lines[0].strip().lower().startswith("subject:"):
-        body_clean_lines = body_clean_lines[1:]
-    if body_clean_lines and subject and body_clean_lines[0].strip().lower() == subject.strip().lower():
-        body_clean_lines = body_clean_lines[1:]
-    body = _normalize_email_body_format("\n".join(body_clean_lines))
+    body_clean = [ln for ln in body.split("\n")]
+    while body_clean and not body_clean[0].strip():
+        body_clean.pop(0)
+    if body_clean and body_clean[0].strip().lower().startswith("subject:"):
+        body_clean = body_clean[1:]
+    if body_clean and subject and body_clean[0].strip().lower() == subject.strip().lower():
+        body_clean = body_clean[1:]
+    body = normalize_email_body_format("\n".join(body_clean))
     if not body:
         raise ValueError("LLM returned no email body")
     return subject, body
-
-
-def _normalize_email_body_format(body: str) -> str:
-    """
-    Normalize generated email layout without changing wording.
-    Keeps prose natural while making whitespace and list indentation stable.
-    """
-    if not body:
-        return ""
-
-    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
-    lines: list[str] = []
-    blank_pending = False
-
-    for raw_line in normalized.split("\n"):
-        line = raw_line.strip()
-        if not line:
-            blank_pending = bool(lines)
-            continue
-
-        bullet_match = re.match(r"^(?:[-*]|\u2022|\d+[.)])\s+(.*)$", line)
-        if bullet_match:
-            line = f"- {bullet_match.group(1).strip()}"
-
-        if blank_pending and lines and lines[-1] != "":
-            lines.append("")
-        lines.append(line)
-        blank_pending = False
-
-    return "\n".join(lines).strip()
 
 
 def _extract_finalized(content: str) -> tuple[str, dict[str, Any] | None]:
     if FINALIZED_MARKER not in content:
         return content.strip(), None
     head, tail = content.split(FINALIZED_MARKER, 1)
-    body = head.strip()
     try:
-        finalized = json.loads(tail.strip())
-        return body, finalized
+        return head.strip(), json.loads(tail.strip())
     except Exception:
         return content.strip(), None
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value or not isinstance(value, str):
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    try:
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def _local_tzinfo(user_timezone: str | None, user_timezone_offset_minutes: int | None):
-    if user_timezone:
-        try:
-            return ZoneInfo(user_timezone)
-        except Exception:
-            pass
-    if user_timezone_offset_minutes is not None:
-        try:
-            return timezone(timedelta(minutes=int(user_timezone_offset_minutes)))
-        except Exception:
-            return None
-    return None
-
-
-def normalize_finalized_event_times(
-    event_data: dict[str, Any],
-    user_timezone: str | None = None,
-    user_timezone_offset_minutes: int | None = None,
-) -> dict[str, Any]:
-    """
-    Ensure finalized start/end are interpreted in sender-local timezone, not UTC.
-    If LLM emits UTC/no-tz timestamps, reinterpret them as local wall-clock times.
-    """
-    if not isinstance(event_data, dict):
-        return event_data
-    tz = _local_tzinfo(user_timezone, user_timezone_offset_minutes)
-    if not tz:
-        return event_data
-
-    out = dict(event_data)
-    for key in ("startTime", "endTime"):
-        raw = out.get(key)
-        if not raw or not isinstance(raw, str):
-            continue
-        dt = _parse_iso_datetime(raw)
-        if not dt:
-            continue
-        is_utc_or_naive = (dt.tzinfo is None) or (dt.utcoffset() == timedelta(0))
-        if not is_utc_or_naive:
-            continue
-        # Keep wall-clock intent (e.g. "3 PM") but pin to user-local timezone.
-        naive = dt.replace(tzinfo=None)
-        localized = naive.replace(tzinfo=tz)
-        out[key] = localized.isoformat()
-    return out
 
 
 def _intervals_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
@@ -547,34 +358,23 @@ def find_conflicting_event(
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
 ) -> dict[str, Any] | None:
-    """
-    Return the first conflicting event if overlap exists, else None.
-    startLocal/endLocal on the returned event are localized to the user's timezone.
-    """
-    start_dt = _parse_iso_datetime(str(event_data.get("startTime", "")))
-    end_dt = _parse_iso_datetime(str(event_data.get("endTime", "")))
+    start_dt = parse_iso_datetime(str(event_data.get("startTime", "")))
+    end_dt = parse_iso_datetime(str(event_data.get("endTime", "")))
     if not start_dt or not end_dt or end_dt <= start_dt:
         return None
 
-    # Query slightly wider to catch events that start earlier but overlap.
     query_min = (start_dt - timedelta(hours=12)).isoformat()
     query_max = (end_dt + timedelta(hours=12)).isoformat()
     events = _get_calendar_events(
-        access_token=access_token,
-        provider=provider,
-        time_min=query_min,
-        time_max=query_max,
-        max_results=50,
+        access_token=access_token, provider=provider,
+        time_min=query_min, time_max=query_max, max_results=50,
         refresh_access_token=refresh_access_token,
-        user_timezone=user_timezone,
-        user_timezone_offset_minutes=user_timezone_offset_minutes,
+        user_timezone=user_timezone, user_timezone_offset_minutes=user_timezone_offset_minutes,
     )
     for ev in events:
-        ev_start = _parse_iso_datetime(ev.get("start"))
-        ev_end = _parse_iso_datetime(ev.get("end"))
-        if not ev_start or not ev_end:
-            continue
-        if _intervals_overlap(start_dt, end_dt, ev_start, ev_end):
+        ev_start = parse_iso_datetime(ev.get("start"))
+        ev_end = parse_iso_datetime(ev.get("end"))
+        if ev_start and ev_end and _intervals_overlap(start_dt, end_dt, ev_start, ev_end):
             return ev
     return None
 
@@ -590,13 +390,6 @@ def generate_scheduling_reply(
     user_timezone_offset_minutes: int | None = None,
     turn_count: int = 0,
 ) -> tuple[str, dict[str, Any] | None]:
-    """
-    Tool-calling LLM loop:
-    1. LLM may call get_calendar_events to check availability
-    2. LLM may call finalize_meeting when both parties agree on a time
-    3. LLM writes the email reply body
-    Returns (reply_body, finalized_event_dict_or_None).
-    """
     client = _openai_client()
 
     turn_context = ""
@@ -615,11 +408,12 @@ def generate_scheduling_reply(
 
     system = SYSTEM_PROMPT.format(sender_name=sender_name, turn_context=turn_context)
     thread_display = "\n---\n".join(thread_messages) if thread_messages else "(no prior messages)"
-    timezone_line = "unknown timezone"
     if user_timezone:
         timezone_line = f"timezone: {user_timezone}"
     elif user_timezone_offset_minutes is not None:
         timezone_line = f"timezone offset: {user_timezone_offset_minutes} minutes from UTC"
+    else:
+        timezone_line = "unknown timezone"
 
     user_prompt = (
         f"Context: {context}\n\n"
@@ -656,14 +450,10 @@ def generate_scheduling_reply(
             body, text_finalized = _extract_finalized(content)
             if text_finalized and not finalized_payload:
                 finalized_payload = text_finalized
-
             if not body:
-                body = (
-                    "Thanks for the update — could you confirm which time slot "
-                    "works best for you?"
-                )
-            body = _strip_leading_greeting(body)
-            body = _normalize_email_body_format(body)
+                body = "Thanks for the update — could you confirm which time slot works best for you?"
+            body = strip_leading_greeting(body)
+            body = normalize_email_body_format(body)
             return body, finalized_payload
 
         messages.append(msg.model_dump(exclude_none=True))
@@ -674,57 +464,25 @@ def generate_scheduling_reply(
 
             if fn_name == "get_calendar_events":
                 events = _get_calendar_events(
-                    access_token=access_token,
-                    provider=provider,
-                    time_min=args.get("timeMin", ""),
-                    time_max=args.get("timeMax", ""),
+                    access_token=access_token, provider=provider,
+                    time_min=args.get("timeMin", ""), time_max=args.get("timeMax", ""),
                     max_results=int(args.get("maxResults", 20)),
                     refresh_access_token=refresh_access_token,
-                    user_timezone=user_timezone,
-                    user_timezone_offset_minutes=user_timezone_offset_minutes,
+                    user_timezone=user_timezone, user_timezone_offset_minutes=user_timezone_offset_minutes,
                 )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(events),
-                })
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(events)})
 
             elif fn_name == "finalize_meeting":
                 finalized_payload = args
-                log_event(
-                    "llm_finalize_meeting_tool_called",
-                    summary=args.get("summary"),
-                    start=args.get("startTime"),
-                    end=args.get("endTime"),
-                    iteration=iteration,
-                )
-                # Return immediately -- don't loop back to the LLM for a
-                # prose confirmation. The push handler sends the final
-                # confirmation message after creating the calendar event.
+                log_event("llm_finalize_meeting_tool_called", summary=args.get("summary"),
+                          start=args.get("startTime"), end=args.get("endTime"), iteration=iteration)
                 return "", finalized_payload
 
             else:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({"error": f"Unknown tool: {fn_name}"}),
-                })
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                  "content": json.dumps({"error": f"Unknown tool: {fn_name}"})})
 
     log_event("generate_scheduling_reply_max_iterations", max_iterations=max_iterations)
-    fallback_body = _normalize_email_body_format(
+    return normalize_email_body_format(
         "Could you confirm the time that works best? I want to make sure we get this booked."
-    )
-    return fallback_body, finalized_payload
-
-
-def _strip_leading_greeting(body: str) -> str:
-    """Remove repetitive greetings from ongoing thread replies."""
-    lines = body.split("\n")
-    while lines and not lines[0].strip():
-        lines = lines[1:]
-    if lines and lines[0].strip().lower().startswith(("hi ", "hello ", "dear ")):
-        lines = lines[1:]
-        while lines and not lines[0].strip():
-            lines = lines[1:]
-        return "\n".join(lines).strip() or body
-    return body
+    ), finalized_payload
