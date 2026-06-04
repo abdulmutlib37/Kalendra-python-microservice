@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import firebase_admin.messaging as fcm_messaging
@@ -8,17 +7,14 @@ import firebase_admin.messaging as fcm_messaging
 from app.firestore_client import get_db
 from app.logging_config import log_event
 
-FCM_TOKENS_COLLECTION = os.getenv("FCM_TOKENS_COLLECTION", "fcm_tokens")
-
-
 def _get_fcm_token(user_email: str) -> str | None:
     try:
-        doc = get_db().collection(FCM_TOKENS_COLLECTION).document(user_email.lower().strip()).get()
+        doc = get_db().collection("user_management").document(user_email.lower().strip()).get()
         if not doc.exists:
             log_event("fcm_token_not_found", user_email=user_email)
             return None
         data = doc.to_dict() or {}
-        token = str(data.get("fcm_token") or "").strip()
+        token = str((data.get("fcmToken") or {}).get("token") or "").strip()
         if not token:
             log_event("fcm_token_empty", user_email=user_email)
             return None
@@ -65,13 +61,20 @@ def send_flow_update(user_email: str, recipient_name: str, recipient_email: str,
         token=token,
         title=name_display,
         body=body,
-        data={"type": "email_flow_update", "recipient_name": name_display, "meeting_title": title, "sender_email": user_email.lower()},
+        data={"type": "email_flow_update", "recipient_name": name_display, "recipient_email": recipient_email.lower(), "meeting_title": title, "sender_email": user_email.lower()},
     )
     if sent:
         log_event("fcm_flow_update_sent", user_email=user_email, recipient_email=recipient_email)
 
 
-def send_flow_completed(user_email: str, recipient_name: str, recipient_email: str, meeting_title: str = "") -> None:
+def send_flow_completed(
+    user_email: str,
+    recipient_name: str,
+    recipient_email: str,
+    meeting_title: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> None:
     token = _get_fcm_token(user_email)
     if not token:
         return
@@ -82,7 +85,14 @@ def send_flow_completed(user_email: str, recipient_name: str, recipient_email: s
         token=token,
         title="Meeting Confirmed",
         body=body,
-        data={"type": "email_flow_completed", "recipient_name": name_display, "meeting_title": title, "sender_email": user_email.lower()},
+        data={
+            "type": "email_flow_completed",
+            "recipient_name": name_display,
+            "meeting_title": title,
+            "sender_email": user_email.lower(),
+            "start_time": (start_time or "").strip(),
+            "end_time": (end_time or "").strip(),
+        },
     )
     if sent:
         log_event("fcm_flow_completed_sent", user_email=user_email, recipient_email=recipient_email)
