@@ -6,7 +6,7 @@ from app.logging_config import get_logger, get_or_create_correlation_id, setup_l
 from app.repository import init_root_doc
 from app.token_manager import TokenManager
 
-from app.api import email_routes, fcm_routes, health_routes, push_routes, token_routes, watch_routes
+from app.api import email_routes, fcm_routes, health_routes, push_routes, thread_routes, token_routes, watch_routes
 
 setup_logging()
 logger = get_logger()
@@ -34,6 +34,7 @@ app.include_router(email_routes.create_router(token_manager))
 app.include_router(push_routes.create_router(token_manager))
 app.include_router(token_routes.create_router(token_manager))
 app.include_router(watch_routes.create_router(token_manager))
+app.include_router(thread_routes.create_router(token_manager))
 
 
 if __name__ == "__main__":
