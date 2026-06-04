@@ -24,7 +24,7 @@ from app.services.agent_service import (
 from app.services.fcm_service import send_flow_completed, send_flow_update
 from app.token_manager import TokenManager
 from app.utils.http_client import request_with_refresh
-from app.utils.text_utils import strip_reply_prefix
+from app.utils.text_utils import strip_reply_prefix, strip_quoted_reply
 from app.utils.time_utils import format_event_time, normalize_finalized_event_times
 
 OUTLOOK_API_BASE = "https://graph.microsoft.com/v1.0"
@@ -33,6 +33,38 @@ MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
 
 def _outlook(token: str, method: str, path: str, refresh_fn: Callable[[], str | None] | None = None, **kwargs):
     return request_with_refresh(method, f"{OUTLOOK_API_BASE}{path}", token, refresh_fn, **kwargs)
+
+
+def get_thread_messages_structured(thread_data: dict) -> list[dict]:
+    """Parse Outlook conversation_messages into structured dicts: {sender, body, timestamp (ISO)}."""
+    raw_messages = list(thread_data.get("conversation_messages") or [])
+    if not raw_messages:
+        return []
+
+    initiated_at = thread_data.get("initiated_at")
+    try:
+        base_dt = datetime.fromisoformat(str(initiated_at)) if initiated_at else datetime.now(timezone.utc)
+        if base_dt.tzinfo is None:
+            base_dt = base_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        base_dt = datetime.now(timezone.utc)
+
+    result = []
+    for i, raw in enumerate(raw_messages):
+        lines = str(raw).split("\n", 1)
+        sender = ""
+        body = raw
+        if len(lines) == 2 and lines[0].startswith("From:"):
+            sender = lines[0][len("From:"):].strip()
+            body = lines[1].strip()
+        # Spread messages evenly from initiated_at; last message is closest to now
+        msg_time = (base_dt + (datetime.now(timezone.utc) - base_dt) * (i / max(len(raw_messages) - 1, 1)))
+        result.append({
+            "sender": sender,
+            "body": body,
+            "timestamp": msg_time.isoformat(),
+        })
+    return result
 
 
 def renew_outlook_watch(user_email: str, token_manager: TokenManager) -> dict[str, Any]:
@@ -99,6 +131,7 @@ def _send_initial_email(
     token: str, to_email: str, sender_name: str,
     recipient_name: str | None, context: str,
     custom_subject: str | None = None, custom_body: str | None = None,
+    tone: str | None = None,
 ) -> dict[str, Any]:
     if custom_subject and custom_body:
         subject = custom_subject.strip()
@@ -109,6 +142,7 @@ def _send_initial_email(
                 sender_name=sender_name,
                 recipient_name=(recipient_name or "").strip() or "there",
                 context=(context or "").strip() or "schedule a meeting",
+                tone=tone,
             )
         except Exception as exc:
             log_event("initial_email_llm_failed", error=str(exc), to=to_email)
@@ -223,8 +257,14 @@ def _handle_finalization(
         friendly_time = format_event_time(finalized_payload.get("startTime", ""))
         confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
         _send_reply(token, user_email, message_id, confirm_text, refresh_fn)
-        send_flow_completed(user_email=user_email, recipient_name=thread_data.get("recipient_name", ""), recipient_email=from_email,
-                            meeting_title=finalized_payload.get("summary", ""))
+        send_flow_completed(
+            user_email=user_email,
+            recipient_name=thread_data.get("recipient_name", ""),
+            recipient_email=from_email,
+            meeting_title=finalized_payload.get("summary", ""),
+            start_time=finalized_payload.get("startTime", ""),
+            end_time=finalized_payload.get("endTime", ""),
+        )
         delete_thread(thread_doc_id)
         log_event("thread_finalized", thread_doc_id=thread_doc_id, provider="outlook")
         return True, None
@@ -236,7 +276,9 @@ def _handle_finalization(
 def initiate_outlook_email_flow(
     outlook_access_token: str, sender_name: str, recipient_email: str,
     recipient_name: str | None, context: str,
+    refresh_token: str | None = None,
     email_subject: str | None = None, email_body: str | None = None,
+    tone: str | None = None,
     user_timezone: str | None = None, user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
 ) -> dict[str, Any]:
@@ -254,15 +296,32 @@ def initiate_outlook_email_flow(
     if not user_email:
         return {"ok": False, "error": "outlook_profile_missing_email", "status_code": 401}
 
-    if token_manager is not None:
-        existing_refresh = token_manager.get_existing_refresh_token(user_email, "outlook")
-        refresh_to_store = existing_refresh or token
-        token_manager.store_tokens(user_email=user_email, provider="outlook",
-                                   access_token=token, refresh_token=refresh_to_store, expires_in_seconds=3300)
+    # Store tokens keyed on the Outlook profile email so the webhook handler
+    # (which extracts user_email from clientState) can retrieve them later.
+    rt = (refresh_token or "").strip()
+    if token_manager and rt:
+        existing_rt = token_manager.get_existing_refresh_token(user_email, "outlook")
+        token_manager.store_tokens(
+            user_email=user_email,
+            provider="outlook",
+            access_token=token,
+            refresh_token=existing_rt or rt,
+            expires_in_seconds=3600,
+        )
+    elif token_manager:
+        existing_rt = token_manager.get_existing_refresh_token(user_email, "outlook")
+        if existing_rt:
+            token_manager.store_tokens(
+                user_email=user_email,
+                provider="outlook",
+                access_token=token,
+                refresh_token=existing_rt,
+                expires_in_seconds=3600,
+            )
 
     send_result = _send_initial_email(token=token, to_email=recipient_email, sender_name=sender_name,
                                       recipient_name=recipient_name, context=context or "",
-                                      custom_subject=email_subject, custom_body=email_body)
+                                      custom_subject=email_subject, custom_body=email_body, tone=tone)
     if not send_result.get("ok"):
         return {"ok": False, "error": send_result.get("error", "failed_to_send_initial_outlook_email"),
                 "status_code": int(send_result.get("status_code") or 502)}
@@ -275,6 +334,7 @@ def initiate_outlook_email_flow(
         "gmail_thread_id": thread_id, "status": "active", "state": "open", "turn_count": 0,
         "context": context or "", "sender_name": sender_name,
         "recipient_email": recipient_email.lower(), "recipient_name": (recipient_name or "").strip(),
+        "summary": (email_subject or "").strip(),
         "user_timezone": (user_timezone or "").strip(), "user_timezone_offset_minutes": user_timezone_offset_minutes,
         "attendees": [recipient_email.lower()], "source": "node_execute_initiate_email_flow",
         "initiated_at": datetime.now(timezone.utc),
@@ -383,6 +443,8 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
             user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
             user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
             turn_count=turn_count,
+            recipient_email=thread_data.get("recipient_email", ""),
+            recipient_name=thread_data.get("recipient_name", ""),
         )
         if not reply_text and not finalized_payload:
             continue

@@ -24,6 +24,39 @@ def normalize_email_body_format(body: str) -> str:
     return "\n".join(lines).strip()
 
 
+def strip_quoted_reply(text: str) -> str:
+    """Remove quoted reply blocks from an email body, keeping only the new message content."""
+    lines = text.splitlines()
+    clean: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Any line starting with > is quoted
+        if stripped.startswith(">"):
+            break
+
+        # --- or ___ separator lines
+        if re.match(r"^[-_]{3,}$", stripped):
+            break
+
+        # "On <date>, <name> wrote:" — may span 1–3 lines ending with "wrote:"
+        if re.match(r"^on\s+", stripped, re.IGNORECASE):
+            lookahead = " ".join(lines[i:i + 4]).strip()
+            if re.search(r"wrote:\s*$", lookahead, re.IGNORECASE):
+                break
+
+        # "From: " header at the start of a forwarded block (only stop if we already have content)
+        if re.match(r"^from\s*:", stripped, re.IGNORECASE) and clean:
+            break
+
+        clean.append(line)
+        i += 1
+
+    return "\n".join(clean).strip()
+
+
 def strip_reply_prefix(subject: str) -> str:
     return re.sub(r"^(re|fwd?)\s*:\s*", "", subject.strip(), flags=re.IGNORECASE).strip()
 

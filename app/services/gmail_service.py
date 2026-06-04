@@ -33,11 +33,17 @@ from app.services.agent_service import (
 from app.services.fcm_service import send_flow_completed, send_flow_update
 from app.token_manager import TokenManager
 from app.utils.http_client import request_with_refresh
-from app.utils.text_utils import strip_reply_prefix
+from app.utils.text_utils import strip_reply_prefix, strip_quoted_reply
 from app.utils.time_utils import format_event_time, normalize_finalized_event_times
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
+_SNIPPET_MAX_CHARS = 120
+
+
+def _make_snippet(text: str) -> str:
+    text = " ".join(text.split())
+    return text[:_SNIPPET_MAX_CHARS].rstrip() + ("..." if len(text) > _SNIPPET_MAX_CHARS else "")
 
 
 def _gmail(token: str, method: str, path: str, refresh_fn: Callable[[], str | None] | None = None, **kwargs):
@@ -111,6 +117,7 @@ def _ensure_watch(token: str, user_email: str) -> dict[str, Any]:
 
     resp = _gmail(token, "POST", "/watch", json=body)
     if resp.status_code != 200:
+        log_event("gmail_watch_http_error", status_code=resp.status_code, response=resp.text[:500], topic=topic)
         return {"ok": False, "error": f"watch_failed:{resp.status_code}", "response": resp.text[:500]}
 
     payload = resp.json()
@@ -176,6 +183,71 @@ def _get_thread_messages(token: str, thread_id: str, refresh_fn=None) -> list[st
     return messages
 
 
+def _strip_quoted_reply(text: str) -> str:
+    """Remove quoted reply blocks from email body, keeping only the new message content."""
+    # Remove Gmail-style HTML quote block if present (shouldn't be in plain text but guard anyway)
+    # Split into lines and walk until we hit a quote boundary
+    lines = text.splitlines()
+    clean: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Hard stop: any line starting with >
+        if stripped.startswith(">"):
+            break
+
+        # Hard stop: --- or ___ separator lines
+        if re.match(r"^[-_]{3,}$", stripped):
+            break
+
+        # "On <date>, <name> wrote:" — may span 1–3 lines ending with "wrote:"
+        # Detect the start: line begins with "On " and either ends with "wrote:" on same
+        # line or within the next 3 lines
+        if re.match(r"^on\s+", stripped, re.IGNORECASE):
+            # Gather up to 4 lines to see if this block ends with "wrote:"
+            lookahead = " ".join(lines[i:i+4]).strip()
+            if re.search(r"wrote:\s*$", lookahead, re.IGNORECASE):
+                break
+
+        # "From: " header at the start of a forwarded block (only stop if we already have content)
+        if re.match(r"^from\s*:", stripped, re.IGNORECASE) and clean:
+            break
+
+        clean.append(line)
+        i += 1
+
+    return "\n".join(clean).strip()
+
+
+def get_thread_messages_structured(token: str, thread_id: str, refresh_fn=None) -> list[dict]:
+    """Return thread messages as structured dicts: {sender, body, timestamp (ISO)}."""
+    resp = _gmail(token, "GET", f"/threads/{thread_id}", refresh_fn, params={"format": "full"})
+    if resp.status_code != 200:
+        log_event("gmail_thread_fetch_failed", thread_id=thread_id, status_code=resp.status_code)
+        return []
+    result = []
+    for m in resp.json().get("messages", []):
+        payload = m.get("payload", {})
+        headers = {h.get("name", ""): h.get("value", "") for h in payload.get("headers", [])}
+        sender = headers.get("From", "Unknown")
+        raw_body = _extract_text_body(payload).strip() or (m.get("snippet") or "").strip()
+        body = _strip_quoted_reply(raw_body)
+        if not body:
+            continue
+        internal_ms = m.get("internalDate")
+        if internal_ms:
+            try:
+                ts = datetime.fromtimestamp(int(internal_ms) / 1000, tz=timezone.utc).isoformat()
+            except Exception:
+                ts = headers.get("Date", "")
+        else:
+            ts = headers.get("Date", "")
+        result.append({"sender": sender, "body": body, "timestamp": ts})
+    return result
+
+
 def _send_reply(token: str, user_email: str, to_email: str, subject: str, body: str,
                 thread_id: str, parent_message_id: str, refresh_fn=None) -> bool:
     subj = subject.strip() or "Re:"
@@ -196,17 +268,34 @@ def _send_reply(token: str, user_email: str, to_email: str, subject: str, body: 
 
 
 def _send_initial_email(token: str, to_email: str, sender_name: str, recipient_name: str | None,
-                        context: str, custom_subject: str | None = None, custom_body: str | None = None) -> tuple[str | None, str | None]:
+                        context: str, custom_subject: str | None = None, custom_body: str | None = None,
+                        tone: str | None = None) -> tuple[str | None, str | None]:
     if custom_subject and custom_body:
         subject = custom_subject.strip()
         body = custom_body.strip()
-    else:
+    elif custom_body:
+        body = custom_body.strip()
         try:
-            subject, body = generate_initial_email(
+            generated_subject, _ = generate_initial_email(
                 sender_name=sender_name,
                 recipient_name=(recipient_name or "").strip() or "there",
                 context=(context or "").strip() or "schedule a meeting",
+                tone=tone,
             )
+            subject = custom_subject.strip() if custom_subject else generated_subject
+        except Exception as exc:
+            log_event("initial_email_llm_failed", error=str(exc), to=to_email)
+            subject = custom_subject.strip() if custom_subject else "Meeting Request"
+    else:
+        try:
+            generated_subject, generated_body = generate_initial_email(
+                sender_name=sender_name,
+                recipient_name=(recipient_name or "").strip() or "there",
+                context=(context or "").strip() or "schedule a meeting",
+                tone=tone,
+            )
+            subject = custom_subject.strip() if custom_subject else generated_subject
+            body = generated_body
         except Exception as exc:
             log_event("initial_email_llm_failed", error=str(exc), to=to_email)
             return None, None
@@ -296,8 +385,14 @@ def _handle_finalization(
         confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
         _send_reply(token, user_email, from_email, meta.get("subject", "Re:"), confirm_text,
                     thread_id, meta.get("message_id_header", ""), refresh_fn)
-        send_flow_completed(user_email=user_email, recipient_name=thread_data.get("recipient_name", ""), recipient_email=from_email,
-                            meeting_title=finalized_payload.get("summary", ""))
+        send_flow_completed(
+            user_email=user_email,
+            recipient_name=thread_data.get("recipient_name", ""),
+            recipient_email=from_email,
+            meeting_title=finalized_payload.get("summary", ""),
+            start_time=finalized_payload.get("startTime", ""),
+            end_time=finalized_payload.get("endTime", ""),
+        )
         delete_thread(thread_doc_id)
         log_event("thread_finalized", thread_doc_id=thread_doc_id)
         return True, None
@@ -324,6 +419,7 @@ def initiate_google_email_flow(
     google_access_token: str, sender_name: str, recipient_email: str,
     recipient_name: str | None, context: str,
     email_subject: str | None = None, email_body: str | None = None,
+    tone: str | None = None,
     user_timezone: str | None = None, user_timezone_offset_minutes: int | None = None,
     token_manager: TokenManager | None = None,
 ) -> dict[str, Any]:
@@ -355,14 +451,17 @@ def initiate_google_email_flow(
 
     thread_id, _ = _send_initial_email(token=token, to_email=recipient_email, sender_name=sender_name,
                                         recipient_name=recipient_name, context=context or "",
-                                        custom_subject=email_subject, custom_body=email_body)
+                                        custom_subject=email_subject, custom_body=email_body, tone=tone)
     if not thread_id:
         return {"ok": False, "error": "failed_to_send_initial_email", "status_code": 502}
 
+    sent_body = email_body or ""
     created = create_thread(provider="google", user_email=user_email, data={
         "gmail_thread_id": thread_id, "status": "active", "state": "open", "turn_count": 0,
         "context": context or "", "sender_name": sender_name,
         "recipient_email": recipient_email.lower(), "recipient_name": (recipient_name or "").strip(),
+        "summary": (email_subject or "").strip(),
+        "last_message_snippet": _make_snippet(sent_body) if sent_body else "",
         "user_timezone": (user_timezone or "").strip(), "user_timezone_offset_minutes": user_timezone_offset_minutes,
         "attendees": [recipient_email.lower()], "source": "node_execute_initiate_email_flow",
         "initiated_at": datetime.now(timezone.utc),
@@ -486,6 +585,8 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if not convo:
                     continue
 
+                last_msg = convo[-1] if convo else ""
+                incoming_snippet = _make_snippet(last_msg if isinstance(last_msg, str) else last_msg.get("body", ""))
                 guardrail_text = _guardrail_reply(convo)
                 if guardrail_text:
                     sent = _send_reply(token, email_address, from_email, meta.get("subject", "Re:"),
@@ -494,7 +595,10 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                         replied += 1
                         save_thread(thread_doc_id, {"gmail_thread_id": thread_id, "status": "active", "state": "open",
                                                      "turn_count": turn_count + 1, "last_message_id": msg_id,
+                                                     "last_message_snippet": _make_snippet(guardrail_text),
                                                      "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))})
+                    else:
+                        save_thread(thread_doc_id, {"last_message_snippet": incoming_snippet})
                     processed_items += 1
                     continue
 
@@ -504,7 +608,10 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                                        closing_text, thread_id, meta.get("message_id_header", ""), refresh_fn)
                     if sent:
                         replied += 1
-                        save_thread(thread_doc_id, {"turn_count": turn_count + 1, "last_message_id": msg_id})
+                        save_thread(thread_doc_id, {"turn_count": turn_count + 1, "last_message_id": msg_id,
+                                                     "last_message_snippet": _make_snippet(closing_text)})
+                    else:
+                        save_thread(thread_doc_id, {"last_message_snippet": incoming_snippet})
                     processed_items += 1
                     continue
 
@@ -516,6 +623,8 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
                     user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
                     turn_count=turn_count,
+                    recipient_email=thread_data.get("recipient_email", ""),
+                    recipient_name=thread_data.get("recipient_name", ""),
                 )
                 if not reply_text and not finalized_payload:
                     continue
@@ -536,6 +645,7 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 sent = _send_reply(token, email_address, from_email, meta.get("subject", "Re:"),
                                    reply_text, thread_id, meta.get("message_id_header", ""), refresh_fn)
                 if not sent:
+                    save_thread(thread_doc_id, {"last_message_snippet": incoming_snippet})
                     continue
 
                 send_flow_update(user_email=email_address, recipient_name=thread_data.get("recipient_name", ""), recipient_email=from_email,
@@ -543,6 +653,7 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 replied += 1
                 save_thread(thread_doc_id, {"gmail_thread_id": thread_id, "status": "active", "state": "open",
                                              "turn_count": turn_count + 1, "last_message_id": msg_id,
+                                             "last_message_snippet": _make_snippet(reply_text),
                                              "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))})
                 processed_items += 1
             except Exception as exc:
