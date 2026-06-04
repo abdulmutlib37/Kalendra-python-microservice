@@ -17,12 +17,14 @@ class InitiateEmailFlowRequest(BaseModel):
     access_token: str | None = None
     google_access_token: str | None = None
     outlook_access_token: str | None = None
+    refresh_token: str | None = None
     sender_name: str
     recipient_email: str
     recipient_name: str | None = None
     context: str | None = None
     email_subject: str | None = None
     email_body: str | None = None
+    tone: str | None = "friendly"
     user_timezone: str | None = None
     user_timezone_offset_minutes: int | None = None
 
@@ -40,6 +42,7 @@ def create_router(token_manager: TokenManager) -> APIRouter:
         if provider not in {"google", "outlook"}:
             raise HTTPException(status_code=400, detail="provider must be google or outlook")
 
+        tone = (payload.tone or "friendly").strip().lower()
         if provider == "google":
             token = (payload.access_token or payload.google_access_token or "").strip()
             result = initiate_google_email_flow(
@@ -50,20 +53,24 @@ def create_router(token_manager: TokenManager) -> APIRouter:
                 context=payload.context or "",
                 email_subject=payload.email_subject,
                 email_body=payload.email_body,
+                tone=tone,
                 user_timezone=(payload.user_timezone or "").strip() or None,
                 user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
                 token_manager=token_manager,
             )
         else:
             token = (payload.access_token or payload.outlook_access_token or "").strip()
+            refresh_token = (payload.refresh_token or "").strip() or None
             result = initiate_outlook_email_flow(
                 outlook_access_token=token,
+                refresh_token=refresh_token,
                 sender_name=payload.sender_name,
                 recipient_email=payload.recipient_email,
                 recipient_name=payload.recipient_name,
                 context=payload.context or "",
                 email_subject=payload.email_subject,
                 email_body=payload.email_body,
+                tone=tone,
                 user_timezone=(payload.user_timezone or "").strip() or None,
                 user_timezone_offset_minutes=payload.user_timezone_offset_minutes,
                 token_manager=token_manager,
@@ -82,6 +89,7 @@ def create_router(token_manager: TokenManager) -> APIRouter:
         recipient_name: str = Body(...),
         context: str = Body(...),
         preferred_subject: str | None = Body(default=None),
+        tone: str | None = Body(default=None),
     ):
         try:
             subject, body = generate_initial_email(
@@ -89,6 +97,7 @@ def create_router(token_manager: TokenManager) -> APIRouter:
                 recipient_name=recipient_name or "there",
                 context=context or "schedule a meeting",
                 preferred_subject=preferred_subject,
+                tone=tone,
             )
             return {"subject": subject, "body": body}
         except Exception as exc:

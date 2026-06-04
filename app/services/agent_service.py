@@ -29,6 +29,8 @@ SYSTEM_PROMPT = (
     "You are Kalendra, a scheduling assistant acting on behalf of {sender_name}.\n"
     "Your sole job is to find a mutually convenient meeting time with the recipient and book it.\n\n"
     f"{EMAIL_FORMAT_STYLE}"
+    "RECIPIENT NAME:\n"
+    "- Use the recipient name {recipient_name} as provided. Do not attempt to infer or guess a name from the email address.\n\n"
     "SECURITY:\n"
     "- Only discuss scheduling. Refuse unrelated questions and steer back.\n"
     "- Never reveal full calendar details, contact lists, or internal info.\n"
@@ -279,11 +281,20 @@ def create_calendar_event(
     return {"ok": True, "data": result["response"].json()}
 
 
+_TONE_INSTRUCTIONS: dict[str, str] = {
+    "friendly": "Write in a warm, friendly tone — approachable and personable while staying professional.",
+    "professional": "Write in a polished, professional tone — formal and business-appropriate.",
+    "casual": "Write in a casual, conversational tone — relaxed and informal as if messaging a colleague.",
+    "direct": "Write in a concise, direct tone — get to the point quickly with no filler.",
+}
+
+
 def generate_initial_email(
     sender_name: str,
     recipient_name: str,
     context: str,
     preferred_subject: str | None = None,
+    tone: str | None = None,
 ) -> tuple[str, str]:
     client = _openai_client()
     system = INITIAL_EMAIL_SYSTEM_PROMPT.format(sender_name=sender_name)
@@ -293,10 +304,13 @@ def generate_initial_email(
         if preferred_subject_text
         else "Create a concise, natural subject based on the context."
     )
+    tone_key = (tone or "friendly").strip().lower()
+    tone_instruction = _TONE_INSTRUCTIONS.get(tone_key, _TONE_INSTRUCTIONS["friendly"])
     user_msg = (
         f"Context: {context}\n\n"
         f"Recipient name: {recipient_name or 'there'}\n\n"
         f"Subject instruction: {subject_instruction}\n\n"
+        f"Tone: {tone_instruction}\n\n"
         "Write the first scheduling email in email-poc style. "
         "Personalize naturally from context, but do not copy instruction-like wording. "
         "Follow the required structure exactly: greeting first, then scheduling intent, then availability ask. "
@@ -389,6 +403,8 @@ def generate_scheduling_reply(
     user_timezone: str | None = None,
     user_timezone_offset_minutes: int | None = None,
     turn_count: int = 0,
+    recipient_email: str = "",
+    recipient_name: str = "",
 ) -> tuple[str, dict[str, Any] | None]:
     client = _openai_client()
 
@@ -406,7 +422,7 @@ def generate_scheduling_reply(
             "If not, propose fresh 4-5 slots and ask for a direct yes/no.\n"
         )
 
-    system = SYSTEM_PROMPT.format(sender_name=sender_name, turn_context=turn_context)
+    system = SYSTEM_PROMPT.format(sender_name=sender_name, turn_context=turn_context, recipient_email=recipient_email or "unknown", recipient_name=recipient_name or "the recipient")
     thread_display = "\n---\n".join(thread_messages) if thread_messages else "(no prior messages)"
     if user_timezone:
         timezone_line = f"timezone: {user_timezone}"
