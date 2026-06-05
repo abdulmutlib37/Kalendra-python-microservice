@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -119,7 +120,7 @@ INITIAL_EMAIL_SYSTEM_PROMPT = (
     "4. Ask for their availability/free time (e.g., 'Could you share your availability for next week?')\n"
     "5. Friendly closing question (e.g., 'What times work best for you?')\n"
     "6. Sign-off with 'Best regards,' or 'Thanks,' followed by {sender_name}\n"
-    "7. ALWAYS end with a blank line, then: 'Email Scheduling - Powered by Kalendra'\n\n"
+    "7. End with the sign-off — do not add any tagline or branding line after the sign-off\n\n"
     "Guidelines:\n"
     "- Be warm, professional, and natural - write like a thoughtful human assistant\n"
     "- Keep the email 4-6 sentences (not too short, not too long)\n"
@@ -391,6 +392,141 @@ def find_conflicting_event(
         if ev_start and ev_end and _intervals_overlap(start_dt, end_dt, ev_start, ev_end):
             return ev
     return None
+
+
+_INTENT_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "recipient_intent",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "enum": [
+                        "new_time_suggestion",
+                        "reschedule_booked",
+                        "cancelled",
+                        "needs_clarification",
+                        "none",
+                    ],
+                    "description": (
+                        "new_time_suggestion: recipient proposed a specific day and/or time. "
+                        "reschedule_booked: meeting already confirmed and recipient wants to move or change it (but not cancel). "
+                        "cancelled: recipient explicitly declines or cancels the meeting entirely "
+                        "(e.g. 'not interested', 'please cancel', 'I won\\'t be able to make it', 'let\\'s not do this'). "
+                        "needs_clarification: the message is ambiguous, vague, or confusing — the scheduling assistant "
+                        "cannot determine availability or intent without human input "
+                        "(e.g. unclear references, contradictory statements, off-topic replies that don\\'t fit other categories). "
+                        "none: normal reply, no special action needed."
+                    ),
+                },
+                "proposed_day": {
+                    "type": "string",
+                    "description": "Human-readable day string if intent is new_time_suggestion, else empty string.",
+                },
+                "proposed_time": {
+                    "type": "string",
+                    "description": "Human-readable time string if intent is new_time_suggestion, else empty string.",
+                },
+                "conflict_day": {
+                    "type": "string",
+                    "description": "If the recipient mentions they have a conflict or are busy at a specific time, the day label (e.g. 'Monday', 'Tuesday afternoon'). Else empty string.",
+                },
+                "conflict_time": {
+                    "type": "string",
+                    "description": "If the recipient mentions they have a conflict or are busy at a specific time, the time label (e.g. '3:00 PM'). Else empty string.",
+                },
+            },
+            "required": ["intent", "proposed_day", "proposed_time", "conflict_day", "conflict_time"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def classify_recipient_intent(
+    incoming_message: str,
+    thread_status: str = "active",
+) -> dict:
+    """
+    Classify the intent of the recipient's incoming message using structured LLM output.
+    Pass the raw incoming email body (before the agent replies), not the full convo.
+    Returns a dict with keys: intent, proposed_day, proposed_time.
+    calendar_conflict is detected in _handle_finalization; stalled via should_fire_stalled.
+    """
+    _default = {"intent": "none", "proposed_day": "", "proposed_time": "", "conflict_day": "", "conflict_time": ""}
+
+    if not incoming_message or not incoming_message.strip():
+        return _default
+
+    try:
+        client = _openai_client()
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            response_format=_INTENT_SCHEMA,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a scheduling intent classifier. Classify the intent of this recipient email.\n\n"
+                        "Rules — pick exactly one:\n"
+                        "- new_time_suggestion: recipient proposes a specific day and/or time "
+                        "(e.g. 'How about Monday at 3pm?', 'Tuesday works for me', 'Can we do Friday afternoon?'). "
+                        "Fill proposed_day and proposed_time from the message text.\n"
+                        "- reschedule_booked: the meeting is already confirmed/booked and the recipient wants to "
+                        "move or change it to a different time (e.g. 'Can we move our meeting?', 'Need to reschedule our call'). "
+                        f"Only use this when thread_status is 'completed'. Current thread_status: {thread_status}.\n"
+                        "- cancelled: recipient explicitly declines or cancels the meeting entirely "
+                        "(e.g. 'not interested', 'please cancel', 'I won\\'t be able to make it', "
+                        "'let\\'s not do this', 'nevermind', 'please disregard'). "
+                        "Use this for both active and completed threads.\n"
+                        "- needs_clarification: the message is ambiguous or confusing and a human needs to read it "
+                        "(e.g. unclear intent, contradictory info, strange or off-topic content that doesn't fit any other category). "
+                        "- none: anything else — greetings, questions, acknowledgements, general replies "
+                        "that don't propose a time and aren't about rescheduling or cancelling.\n\n"
+                        "Also extract conflict fields independently of intent:\n"
+                        "- conflict_day/conflict_time: fill these if the recipient explicitly says they have a conflict, "
+                        "are busy, or have something else at a specific time "
+                        "(e.g. 'I have a meeting at 3pm', 'I\\'m busy Monday morning', 'there\\'s a conflict at 2pm'). "
+                        "These can coexist with new_time_suggestion (they mention a conflict AND propose another time)."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Recipient message to classify:\n{incoming_message.strip()}",
+                },
+            ],
+        )
+        raw = response.choices[0].message.content or ""
+        result = json.loads(raw)
+        if thread_status != "completed" and result.get("intent") == "reschedule_booked":
+            result["intent"] = "none"
+        # cancelled is valid on any thread_status — no guard needed
+        return result
+    except Exception as exc:
+        log_event("classify_recipient_intent_failed", error=str(exc))
+        return _default
+
+
+def should_fire_stalled(turn_count: int, thread_messages: list[str]) -> bool:
+    """
+    Returns True if the thread looks stalled: 3 or 6 full rounds with no agreement.
+    Only fires at exactly turn 3 and turn 6 to avoid spamming.
+    """
+    if turn_count not in (3, 6):
+        return False
+    recent = thread_messages[-8:] if len(thread_messages) >= 8 else thread_messages
+    has_agreement = any(
+        re.search(
+            r"\b(yes|ok|okay|sure|sounds good|works for me|that works|confirmed|"
+            r"let'?s do it|perfect|great|see you then|booked|scheduled)\b",
+            m, re.IGNORECASE,
+        )
+        for m in recent
+    )
+    return not has_agreement
 
 
 def generate_scheduling_reply(
