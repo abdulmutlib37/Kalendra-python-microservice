@@ -5,6 +5,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 from typing import Any, Callable
@@ -13,9 +14,9 @@ from google.auth.transport import requests as g_requests
 from google.oauth2 import id_token as g_id_token
 
 from app.logging_config import log_event
+from app.utils.email_footer import build_html_email
 from app.repository import (
     create_thread,
-    delete_thread,
     find_recent_active_thread_by_recipient,
     find_single_active_thread_for_user,
     find_thread_by_gmail_thread,
@@ -25,12 +26,14 @@ from app.repository import (
     get_watch_state,
 )
 from app.services.agent_service import (
+    classify_recipient_intent,
+    should_fire_stalled,
     create_calendar_event,
     find_conflicting_event,
     generate_initial_email,
     generate_scheduling_reply,
 )
-from app.services.fcm_service import send_flow_completed, send_flow_update
+from app.services.fcm_service import send_flow_completed, send_intent_notification
 from app.token_manager import TokenManager
 from app.utils.http_client import request_with_refresh
 from app.utils.text_utils import strip_reply_prefix, strip_quoted_reply
@@ -39,6 +42,45 @@ from app.utils.time_utils import format_event_time, normalize_finalized_event_ti
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
 _SNIPPET_MAX_CHARS = 120
+
+
+def compute_thread_status(thread_data: dict, intent: str = "") -> str:
+    """
+    Derive the UI-facing thread_status from stored thread fields + optional classified intent.
+
+    Status priority (highest to lowest):
+      cancelled        — LLM classified intent is 'cancelled'
+      meeting_executed — status==completed and finalized_start_time has passed
+      reschedule_requested — status==completed and intent==reschedule_booked
+      scheduled        — status==completed and meeting time is still in the future
+      negotiating_time — status==active and turn_count > 0
+      initiated        — status==active and turn_count == 0
+    """
+    if intent == "cancelled":
+        return "cancelled"
+
+    status = str(thread_data.get("status", "active")).lower()
+    turn_count = int(thread_data.get("turn_count", 0))
+
+    if status == "completed":
+        if intent == "reschedule_booked":
+            return "reschedule_requested"
+        start_str = str(thread_data.get("finalized_start_time", "") or "")
+        if start_str:
+            try:
+                start_dt = datetime.fromisoformat(start_str)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= start_dt:
+                    return "meeting_executed"
+            except Exception:
+                pass
+        return "scheduled"
+
+    # active thread
+    if turn_count == 0:
+        return "initiated"
+    return "negotiating_time"
 
 
 def _make_snippet(text: str) -> str:
@@ -233,7 +275,7 @@ def get_thread_messages_structured(token: str, thread_id: str, refresh_fn=None) 
         headers = {h.get("name", ""): h.get("value", "") for h in payload.get("headers", [])}
         sender = headers.get("From", "Unknown")
         raw_body = _extract_text_body(payload).strip() or (m.get("snippet") or "").strip()
-        body = _strip_quoted_reply(raw_body)
+        body = _strip_quoted_reply(raw_body) or raw_body
         if not body:
             continue
         internal_ms = m.get("internalDate")
@@ -249,16 +291,21 @@ def get_thread_messages_structured(token: str, thread_id: str, refresh_fn=None) 
 
 
 def _send_reply(token: str, user_email: str, to_email: str, subject: str, body: str,
-                thread_id: str, parent_message_id: str, refresh_fn=None) -> bool:
+                thread_id: str, parent_message_id: str, refresh_fn=None,
+                sender_name: str = "") -> bool:
     subj = subject.strip() or "Re:"
     if not subj.lower().startswith("re:"):
         subj = f"Re: {subj}"
-    raw_message = (
-        f"To: {to_email}\r\nSubject: {subj}\r\n"
-        f'Content-Type: text/plain; charset="UTF-8"\r\n'
-        f"In-Reply-To: {parent_message_id}\r\nReferences: {parent_message_id}\r\n\r\n{body}"
-    )
-    raw_b64 = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
+
+    msg = MIMEMultipart("alternative")
+    msg["To"] = to_email
+    msg["Subject"] = subj
+    msg["In-Reply-To"] = parent_message_id
+    msg["References"] = parent_message_id
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+    msg.attach(MIMEText(build_html_email(body, sender_name), "html", "utf-8"))
+
+    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     send_resp = _gmail(token, "POST", "/messages/send", refresh_fn, json={"raw": raw_b64, "threadId": thread_id})
     if send_resp.status_code not in (200, 202):
         log_event("agent_reply_send_failed", user_email=user_email, status_code=send_resp.status_code, response=send_resp.text[:500])
@@ -300,9 +347,11 @@ def _send_initial_email(token: str, to_email: str, sender_name: str, recipient_n
             log_event("initial_email_llm_failed", error=str(exc), to=to_email)
             return None, None
 
-    msg = MIMEText(body)
+    msg = MIMEMultipart("alternative")
     msg["To"] = to_email
     msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+    msg.attach(MIMEText(build_html_email(body, sender_name), "html", "utf-8"))
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     send_resp = _gmail(token, "POST", "/messages/send", json={"raw": raw_b64})
     if send_resp.status_code not in (200, 202):
@@ -332,11 +381,11 @@ def _latest_message_allows_conflict(thread_messages: list[str]) -> bool:
     if not thread_messages:
         return False
     latest = (thread_messages[-1] or "").lower()
+    # Only suppress conflict notification when the user explicitly acknowledged the conflict
     return bool(re.search(
         r"\b(book it anyway|schedule anyway|still book|still schedule|conflict is fine|"
-        r"i am okay with conflict|go ahead anyway|go ahead|do it|book it|yes|sure|"
-        r"that('?s| is) fine|okay|ok|no problem|that works|works for me|"
-        r"you can do it|please do|proceed|confirm it|lock it in)\b", latest))
+        r"i am okay with (the )?conflict|go ahead anyway|conflict (is )?ok|"
+        r"ignore the conflict|don'?t worry about (the )?conflict|proceed (despite|with) (the )?conflict)\b", latest))
 
 
 def _guardrail_reply(thread_messages: list[str]) -> str | None:
@@ -372,6 +421,19 @@ def _handle_finalization(
     if conflict and not _latest_message_allows_conflict(convo):
         raw_start = conflict.get("startLocal") or conflict.get("start") or ""
         conflict_start = format_event_time(raw_start) if raw_start else "that time"
+        # Parse day/time from conflict start for the notification
+        parts = conflict_start.split(" at ", 1)
+        conflict_day = parts[0].strip() if parts else conflict_start
+        conflict_time = parts[1].strip() if len(parts) > 1 else ""
+        send_intent_notification(
+            user_email=user_email,
+            recipient_name=thread_data.get("recipient_name", ""),
+            recipient_email=from_email,
+            meeting_title=thread_data.get("summary", ""),
+            intent="calendar_conflict",
+            conflict_day=conflict_day,
+            conflict_time=conflict_time,
+        )
         return False, f"I have a conflict at {conflict_start}. Should I book this anyway, or would you prefer a different slot?"
 
     existing_attendees = finalized_payload.get("attendees") or []
@@ -384,7 +446,8 @@ def _handle_finalization(
         friendly_time = format_event_time(finalized_payload.get("startTime", ""))
         confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
         _send_reply(token, user_email, from_email, meta.get("subject", "Re:"), confirm_text,
-                    thread_id, meta.get("message_id_header", ""), refresh_fn)
+                    thread_id, meta.get("message_id_header", ""), refresh_fn,
+                    sender_name=thread_data.get("sender_name", ""))
         send_flow_completed(
             user_email=user_email,
             recipient_name=thread_data.get("recipient_name", ""),
@@ -393,7 +456,16 @@ def _handle_finalization(
             start_time=finalized_payload.get("startTime", ""),
             end_time=finalized_payload.get("endTime", ""),
         )
-        delete_thread(thread_doc_id)
+        completed_data = {
+            "status": "completed",
+            "state": "completed",
+            "finalized_at": datetime.now(timezone.utc),
+            "finalized_start_time": finalized_payload.get("startTime", ""),
+            "finalized_end_time": finalized_payload.get("endTime", ""),
+            "finalized_summary": finalized_payload.get("summary", ""),
+        }
+        completed_data["thread_status"] = compute_thread_status(completed_data)
+        save_thread(thread_doc_id, completed_data)
         log_event("thread_finalized", thread_doc_id=thread_doc_id)
         return True, None
     else:
@@ -465,6 +537,7 @@ def initiate_google_email_flow(
         "user_timezone": (user_timezone or "").strip(), "user_timezone_offset_minutes": user_timezone_offset_minutes,
         "attendees": [recipient_email.lower()], "source": "node_execute_initiate_email_flow",
         "initiated_at": datetime.now(timezone.utc),
+        "thread_status": "initiated",
     })
     if not created.get("ok"):
         return {"ok": False, "error": created.get("error", "thread_create_failed"), "status_code": 500}
@@ -555,26 +628,34 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                     thread_doc_id = thread_lookup["data"]["thread_doc_id"]
                     thread_data = thread_lookup["data"]
                 else:
-                    recovered = find_recent_active_thread_by_recipient("google", email_address, from_email)
-                    if recovered.get("ok"):
-                        thread_doc_id = recovered["data"]["thread_doc_id"]
-                        thread_data = recovered["data"]
-                        save_thread(thread_doc_id, {"provider": "google", "user_email": email_address.lower(), "gmail_thread_id": thread_id})
-                        log_event("gmail_push_thread_recovered_by_recipient", user_email=email_address, gmail_thread_id=thread_id, thread_doc_id=thread_doc_id, from_email=from_email)
-                    else:
-                        recovered_single = find_single_active_thread_for_user("google", email_address)
-                        if recovered_single.get("ok"):
-                            thread_doc_id = recovered_single["data"]["thread_doc_id"]
-                            thread_data = recovered_single["data"]
-                            save_thread(thread_doc_id, {"provider": "google", "user_email": email_address.lower(), "gmail_thread_id": thread_id})
-                            log_event("gmail_push_thread_recovered_single_active", user_email=email_address, gmail_thread_id=thread_id, thread_doc_id=thread_doc_id, from_email=from_email)
-                        else:
-                            log_event("gmail_push_untracked_thread_ignored", user_email=email_address, gmail_thread_id=thread_id, from_email=from_email, subject=meta.get("subject", ""))
-                            continue
+                    log_event("gmail_push_untracked_thread_ignored", user_email=email_address, gmail_thread_id=thread_id, from_email=from_email, subject=meta.get("subject", ""))
+                    continue
 
                 mark_res = mark_thread_message_processed(thread_doc_id, msg_id)
                 if not mark_res.get("ok") or mark_res["data"].get("already_processed"):
                     continue
+
+                # Completed threads: allow agent to keep replying until meeting time passes
+                if str(thread_data.get("status", "")).lower() == "completed":
+                    start_str = str(thread_data.get("finalized_start_time", "") or "")
+                    meeting_passed = False
+                    if start_str:
+                        try:
+                            start_dt = datetime.fromisoformat(start_str)
+                            if start_dt.tzinfo is None:
+                                start_dt = start_dt.replace(tzinfo=timezone.utc)
+                            meeting_passed = datetime.now(timezone.utc) >= start_dt
+                        except Exception:
+                            pass
+                    if meeting_passed:
+                        # Meeting time has passed — silently ignore new messages, mark executed
+                        save_thread(thread_doc_id, {
+                            "thread_status": "meeting_executed",
+                            "last_message_id": msg_id,
+                        })
+                        processed_items += 1
+                        continue
+                    # Meeting is still in the future — fall through to let agent reply normally
 
                 turn_count = int(thread_data.get("turn_count", 0))
                 if turn_count >= MAX_AGENT_TURNS:
@@ -585,18 +666,39 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if not convo:
                     continue
 
-                last_msg = convo[-1] if convo else ""
-                incoming_snippet = _make_snippet(last_msg if isinstance(last_msg, str) else last_msg.get("body", ""))
+                # The last message in convo is the recipient's incoming message (agent hasn't replied yet)
+                incoming_body = convo[-1] if convo else ""
+                incoming_snippet = _make_snippet(incoming_body)
+
+                # Classify recipient intent BEFORE agent replies, so we classify the right message
+                intent_result = classify_recipient_intent(
+                    incoming_message=incoming_body,
+                    thread_status=str(thread_data.get("status", "active")),
+                )
+
+                # Stalled check: fire at turn 3 and turn 6 only
+                if should_fire_stalled(turn_count, convo):
+                    send_intent_notification(
+                        user_email=email_address,
+                        recipient_name=thread_data.get("recipient_name", ""),
+                        recipient_email=from_email,
+                        meeting_title=strip_reply_prefix(meta.get("subject", "")),
+                        intent="stalled",
+                    )
+
                 guardrail_text = _guardrail_reply(convo)
                 if guardrail_text:
                     sent = _send_reply(token, email_address, from_email, meta.get("subject", "Re:"),
-                                       guardrail_text, thread_id, meta.get("message_id_header", ""), refresh_fn)
+                                       guardrail_text, thread_id, meta.get("message_id_header", ""), refresh_fn,
+                                       sender_name=thread_data.get("sender_name", ""))
                     if sent:
                         replied += 1
-                        save_thread(thread_doc_id, {"gmail_thread_id": thread_id, "status": "active", "state": "open",
-                                                     "turn_count": turn_count + 1, "last_message_id": msg_id,
-                                                     "last_message_snippet": _make_snippet(guardrail_text),
-                                                     "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))})
+                        updated = {"gmail_thread_id": thread_id, "status": "active", "state": "open",
+                                   "turn_count": turn_count + 1, "last_message_id": msg_id,
+                                   "last_message_snippet": _make_snippet(guardrail_text),
+                                   "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))}
+                        updated["thread_status"] = compute_thread_status({**thread_data, **updated})
+                        save_thread(thread_doc_id, updated)
                     else:
                         save_thread(thread_doc_id, {"last_message_snippet": incoming_snippet})
                     processed_items += 1
@@ -605,7 +707,8 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                 if turn_count >= 10:
                     closing_text = "It seems we're having trouble finding a time. Feel free to reply whenever you have a slot that works, and I'll get it booked right away."
                     sent = _send_reply(token, email_address, from_email, meta.get("subject", "Re:"),
-                                       closing_text, thread_id, meta.get("message_id_header", ""), refresh_fn)
+                                       closing_text, thread_id, meta.get("message_id_header", ""), refresh_fn,
+                                       sender_name=thread_data.get("sender_name", ""))
                     if sent:
                         replied += 1
                         save_thread(thread_doc_id, {"turn_count": turn_count + 1, "last_message_id": msg_id,
@@ -643,18 +746,49 @@ def process_gmail_push(push_payload: dict[str, Any], token_manager: TokenManager
                         reply_text = fallback_text
 
                 sent = _send_reply(token, email_address, from_email, meta.get("subject", "Re:"),
-                                   reply_text, thread_id, meta.get("message_id_header", ""), refresh_fn)
+                                   reply_text, thread_id, meta.get("message_id_header", ""), refresh_fn,
+                                   sender_name=thread_data.get("sender_name", ""))
                 if not sent:
                     save_thread(thread_doc_id, {"last_message_snippet": incoming_snippet})
                     continue
 
-                send_flow_update(user_email=email_address, recipient_name=thread_data.get("recipient_name", ""), recipient_email=from_email,
-                                 meeting_title=strip_reply_prefix(meta.get("subject", "")))
+                # new_time_suggestion / reschedule_booked / cancelled — calendar_conflict fires in _handle_finalization, stalled fires above
+                classified_intent = intent_result.get("intent")
+                if classified_intent not in ("none", None):
+                    send_intent_notification(
+                        user_email=email_address,
+                        recipient_name=thread_data.get("recipient_name", ""),
+                        recipient_email=from_email,
+                        meeting_title=strip_reply_prefix(meta.get("subject", "")),
+                        intent=classified_intent,
+                        proposed_day=intent_result.get("proposed_day", ""),
+                        proposed_time=intent_result.get("proposed_time", ""),
+                    )
+                # Fire conflict notification if recipient mentioned a busy/conflict time
+                if intent_result.get("conflict_day") or intent_result.get("conflict_time"):
+                    send_intent_notification(
+                        user_email=email_address,
+                        recipient_name=thread_data.get("recipient_name", ""),
+                        recipient_email=from_email,
+                        meeting_title=strip_reply_prefix(meta.get("subject", "")),
+                        intent="calendar_conflict",
+                        conflict_day=intent_result.get("conflict_day", ""),
+                        conflict_time=intent_result.get("conflict_time", ""),
+                    )
                 replied += 1
-                save_thread(thread_doc_id, {"gmail_thread_id": thread_id, "status": "active", "state": "open",
-                                             "turn_count": turn_count + 1, "last_message_id": msg_id,
-                                             "last_message_snippet": _make_snippet(reply_text),
-                                             "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))})
+                updated = {"gmail_thread_id": thread_id, "status": "active", "state": "open",
+                           "turn_count": turn_count + 1, "last_message_id": msg_id,
+                           "last_message_snippet": _make_snippet(reply_text),
+                           "attendees": list(set((thread_data.get("attendees") or []) + [from_email]))}
+                if classified_intent == "cancelled":
+                    updated["status"] = "cancelled"
+                    updated["state"] = "cancelled"
+                elif classified_intent == "reschedule_booked" and str(thread_data.get("status", "")).lower() == "completed":
+                    # Keep status=completed so compute_thread_status can return reschedule_requested
+                    updated["status"] = "completed"
+                    updated["state"] = "completed"
+                updated["thread_status"] = compute_thread_status({**thread_data, **updated}, intent=classified_intent or "")
+                save_thread(thread_doc_id, updated)
                 processed_items += 1
             except Exception as exc:
                 log_event("gmail_push_message_process_failed", error=str(exc))
