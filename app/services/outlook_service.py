@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.logging_config import log_event
+from app.utils.email_footer import build_html_email
 from app.repository import (
     create_thread,
-    delete_thread,
     find_thread_by_gmail_thread,
     mark_thread_message_processed,
     save_thread,
@@ -16,12 +16,15 @@ from app.repository import (
     get_watch_state,
 )
 from app.services.agent_service import (
+    classify_recipient_intent,
+    should_fire_stalled,
     create_calendar_event,
     find_conflicting_event,
     generate_initial_email,
     generate_scheduling_reply,
 )
-from app.services.fcm_service import send_flow_completed, send_flow_update
+from app.services.fcm_service import send_flow_completed, send_intent_notification
+from app.services.gmail_service import compute_thread_status
 from app.token_manager import TokenManager
 from app.utils.http_client import request_with_refresh
 from app.utils.text_utils import strip_reply_prefix, strip_quoted_reply
@@ -150,7 +153,7 @@ def _send_initial_email(
 
     draft_resp = _outlook(token, "POST", "/me/messages", json={
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": {"contentType": "HTML", "content": build_html_email(body, sender_name)},
         "toRecipients": [{"emailAddress": {"address": to_email}}],
     })
     if draft_resp.status_code not in (200, 201):
@@ -202,9 +205,8 @@ def _latest_message_allows_conflict(thread_messages: list[str]) -> bool:
     latest = (thread_messages[-1] or "").lower()
     return bool(re.search(
         r"\b(book it anyway|schedule anyway|still book|still schedule|conflict is fine|"
-        r"i am okay with conflict|go ahead anyway|go ahead|do it|book it|yes|sure|"
-        r"that('?s| is) fine|okay|ok|no problem|that works|works for me|"
-        r"you can do it|please do|proceed|confirm it|lock it in)\b", latest))
+        r"i am okay with (the )?conflict|go ahead anyway|conflict (is )?ok|"
+        r"ignore the conflict|don'?t worry about (the )?conflict|proceed (despite|with) (the )?conflict)\b", latest))
 
 
 def _guardrail_reply(thread_messages: list[str]) -> str | None:
@@ -218,10 +220,32 @@ def _guardrail_reply(thread_messages: list[str]) -> str | None:
     return None
 
 
-def _send_reply(token: str, user_email: str, message_id: str, comment: str, refresh_fn: Callable) -> bool:
-    resp = _outlook(token, "POST", f"/me/messages/{message_id}/reply", refresh_fn, json={"comment": comment})
-    if resp.status_code not in (200, 202):
-        log_event("outlook_reply_send_failed", user_email=user_email, status_code=resp.status_code)
+def _send_reply(token: str, user_email: str, message_id: str, comment: str,
+                refresh_fn: Callable, sender_name: str = "") -> bool:
+    # Create a draft reply so we can set an HTML body with the Kalendra footer.
+    draft_resp = _outlook(token, "POST", f"/me/messages/{message_id}/createReply", refresh_fn)
+    if draft_resp.status_code not in (200, 201):
+        log_event("outlook_reply_send_failed", user_email=user_email,
+                  status_code=draft_resp.status_code, stage="createReply")
+        return False
+
+    draft_id = draft_resp.json().get("id")
+    if not draft_id:
+        log_event("outlook_reply_send_failed", user_email=user_email, stage="missing_draft_id")
+        return False
+
+    html_body = build_html_email(comment, sender_name)
+    patch_resp = _outlook(token, "PATCH", f"/me/messages/{draft_id}", refresh_fn,
+                          json={"body": {"contentType": "HTML", "content": html_body}})
+    if patch_resp.status_code not in (200, 201):
+        log_event("outlook_reply_send_failed", user_email=user_email,
+                  status_code=patch_resp.status_code, stage="patch_body")
+        return False
+
+    send_resp = _outlook(token, "POST", f"/me/messages/{draft_id}/send", refresh_fn)
+    if send_resp.status_code not in (200, 202):
+        log_event("outlook_reply_send_failed", user_email=user_email,
+                  status_code=send_resp.status_code, stage="send")
         return False
     return True
 
@@ -245,6 +269,18 @@ def _handle_finalization(
     if conflict and not _latest_message_allows_conflict(convo):
         raw_start = conflict.get("startLocal") or conflict.get("start") or ""
         conflict_start = format_event_time(raw_start) if raw_start else "that time"
+        parts = conflict_start.split(" at ", 1)
+        conflict_day = parts[0].strip() if parts else conflict_start
+        conflict_time = parts[1].strip() if len(parts) > 1 else ""
+        send_intent_notification(
+            user_email=user_email,
+            recipient_name=thread_data.get("recipient_name", ""),
+            recipient_email=from_email,
+            meeting_title=thread_data.get("summary", ""),
+            intent="calendar_conflict",
+            conflict_day=conflict_day,
+            conflict_time=conflict_time,
+        )
         return False, f"I have a conflict at {conflict_start}. Should I book this anyway, or would you prefer a different slot?"
 
     existing_attendees = finalized_payload.get("attendees") or []
@@ -256,7 +292,8 @@ def _handle_finalization(
     if create_result.get("ok"):
         friendly_time = format_event_time(finalized_payload.get("startTime", ""))
         confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
-        _send_reply(token, user_email, message_id, confirm_text, refresh_fn)
+        _send_reply(token, user_email, message_id, confirm_text, refresh_fn,
+                    sender_name=thread_data.get("sender_name", ""))
         send_flow_completed(
             user_email=user_email,
             recipient_name=thread_data.get("recipient_name", ""),
@@ -265,7 +302,16 @@ def _handle_finalization(
             start_time=finalized_payload.get("startTime", ""),
             end_time=finalized_payload.get("endTime", ""),
         )
-        delete_thread(thread_doc_id)
+        completed_data = {
+            "status": "completed",
+            "state": "completed",
+            "finalized_at": datetime.now(timezone.utc),
+            "finalized_start_time": finalized_payload.get("startTime", ""),
+            "finalized_end_time": finalized_payload.get("endTime", ""),
+            "finalized_summary": finalized_payload.get("summary", ""),
+        }
+        completed_data["thread_status"] = compute_thread_status(completed_data)
+        save_thread(thread_doc_id, completed_data)
         log_event("thread_finalized", thread_doc_id=thread_doc_id, provider="outlook")
         return True, None
     else:
@@ -338,6 +384,7 @@ def initiate_outlook_email_flow(
         "user_timezone": (user_timezone or "").strip(), "user_timezone_offset_minutes": user_timezone_offset_minutes,
         "attendees": [recipient_email.lower()], "source": "node_execute_initiate_email_flow",
         "initiated_at": datetime.now(timezone.utc),
+        "thread_status": "initiated",
     })
     if not created.get("ok"):
         return {"ok": False, "error": created.get("error", "thread_create_failed"), "status_code": 500}
@@ -401,6 +448,28 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
         if not mark_res.get("ok") or mark_res["data"].get("already_processed"):
             continue
 
+        # Completed threads: allow agent to keep replying until meeting time passes
+        if str(thread_data.get("status", "")).lower() == "completed":
+            start_str = str(thread_data.get("finalized_start_time", "") or "")
+            meeting_passed = False
+            if start_str:
+                try:
+                    start_dt = datetime.fromisoformat(start_str)
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    meeting_passed = datetime.now(timezone.utc) >= start_dt
+                except Exception:
+                    pass
+            if meeting_passed:
+                # Meeting time has passed — silently ignore new messages, mark executed
+                save_thread(thread_doc_id, {
+                    "thread_status": "meeting_executed",
+                    "last_message_id": message_id,
+                })
+                replied += 1
+                continue
+            # Meeting is still in the future — fall through to let agent reply normally
+
         turn_count = int(thread_data.get("turn_count", 0))
         if turn_count >= MAX_AGENT_TURNS:
             continue
@@ -413,21 +482,42 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
         if not convo:
             continue
 
+        # Classify the recipient's incoming message BEFORE agent replies
+        incoming_body = f"From: {from_email}\n{snippet}" if snippet else ""
+        intent_result = classify_recipient_intent(
+            incoming_message=incoming_body,
+            thread_status=str(thread_data.get("status", "active")),
+        )
+
+        # Stalled check at turn 3 and turn 6 only
+        if should_fire_stalled(turn_count, convo):
+            send_intent_notification(
+                user_email=user_email,
+                recipient_name=thread_data.get("recipient_name", ""),
+                recipient_email=from_email,
+                meeting_title=strip_reply_prefix(msg.get("subject", "")),
+                intent="stalled",
+            )
+
         guardrail_text = _guardrail_reply(convo)
         if guardrail_text:
-            if _send_reply(token, user_email, message_id, guardrail_text, refresh_fn):
+            if _send_reply(token, user_email, message_id, guardrail_text, refresh_fn,
+                       sender_name=thread_data.get("sender_name", "")):
                 replied += 1
-                save_thread(thread_doc_id, {
+                updated_g = {
                     "gmail_thread_id": thread_id, "status": "active", "state": "open",
                     "turn_count": turn_count + 1, "last_message_id": message_id,
                     "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
                     "conversation_messages": (convo + [f"From: {user_email}\n{guardrail_text}"])[-30:],
-                })
+                }
+                updated_g["thread_status"] = compute_thread_status({**thread_data, **updated_g})
+                save_thread(thread_doc_id, updated_g)
             continue
 
         if turn_count >= 10:
             closing_text = "It seems we're having trouble finding a time. Feel free to reply whenever you have a slot that works, and I'll get it booked right away."
-            if _send_reply(token, user_email, message_id, closing_text, refresh_fn):
+            if _send_reply(token, user_email, message_id, closing_text, refresh_fn,
+                           sender_name=thread_data.get("sender_name", "")):
                 replied += 1
                 save_thread(thread_doc_id, {
                     "turn_count": turn_count + 1, "last_message_id": message_id,
@@ -463,15 +553,45 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
 
         if not reply_text:
             continue
-        if _send_reply(token, user_email, message_id, reply_text, refresh_fn):
-            send_flow_update(user_email=user_email, recipient_name=thread_data.get("recipient_name", ""), recipient_email=from_email,
-                             meeting_title=strip_reply_prefix(msg.get("subject", "")))
+        if _send_reply(token, user_email, message_id, reply_text, refresh_fn,
+                       sender_name=thread_data.get("sender_name", "")):
+            # new_time_suggestion / reschedule_booked / cancelled — calendar_conflict fires in _handle_finalization, stalled above
+            classified_intent = intent_result.get("intent")
+            if classified_intent not in ("none", None):
+                send_intent_notification(
+                    user_email=user_email,
+                    recipient_name=thread_data.get("recipient_name", ""),
+                    recipient_email=from_email,
+                    meeting_title=strip_reply_prefix(msg.get("subject", "")),
+                    intent=classified_intent,
+                    proposed_day=intent_result.get("proposed_day", ""),
+                    proposed_time=intent_result.get("proposed_time", ""),
+                )
+            # Fire conflict notification if recipient mentioned a busy/conflict time
+            if intent_result.get("conflict_day") or intent_result.get("conflict_time"):
+                send_intent_notification(
+                    user_email=user_email,
+                    recipient_name=thread_data.get("recipient_name", ""),
+                    recipient_email=from_email,
+                    meeting_title=strip_reply_prefix(msg.get("subject", "")),
+                    intent="calendar_conflict",
+                    conflict_day=intent_result.get("conflict_day", ""),
+                    conflict_time=intent_result.get("conflict_time", ""),
+                )
             replied += 1
-            save_thread(thread_doc_id, {
+            updated_r = {
                 "gmail_thread_id": thread_id, "status": "active", "state": "open",
                 "turn_count": turn_count + 1, "last_message_id": message_id,
                 "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
                 "conversation_messages": (convo + [f"From: {user_email}\n{reply_text}"])[-30:],
-            })
+            }
+            if classified_intent == "cancelled":
+                updated_r["status"] = "cancelled"
+                updated_r["state"] = "cancelled"
+            elif classified_intent == "reschedule_booked" and str(thread_data.get("status", "")).lower() == "completed":
+                updated_r["status"] = "completed"
+                updated_r["state"] = "completed"
+            updated_r["thread_status"] = compute_thread_status({**thread_data, **updated_r}, intent=classified_intent or "")
+            save_thread(thread_doc_id, updated_r)
 
     return {"ok": True, "data": {"replied_count": replied, "finalized_count": finalized}}
