@@ -6,8 +6,9 @@ from fastapi import APIRouter, HTTPException
 
 from app.logging_config import log_event
 from app.repository import find_recent_active_thread_by_recipient
-from app.repository.thread_repo import _threads_col
+from app.repository.thread_repo import _threads_col, save_thread
 from app.services.gmail_service import get_thread_messages_structured as gmail_messages
+from app.services.gmail_service import compute_thread_status
 from app.services.outlook_service import get_thread_messages_structured as outlook_messages
 from app.token_manager import TokenManager
 
@@ -53,43 +54,71 @@ def _scan_active_threads(user_email: str, recipient_email: str) -> tuple[dict | 
 
 def create_router(token_manager: TokenManager) -> APIRouter:
     @router.get("/list-active-threads")
-    async def list_active_threads(user_email: str):
+    async def list_active_threads(user_email: str, status_filter: str = ""):
         """
-        Return all active email scheduling threads for a given user.
-        Query param: user_email — the sender/account email.
+        Return scheduling threads for a given user.
+        Query params:
+          user_email     — the sender/account email (required)
+          status_filter  — optional comma-separated list of thread_status values to include
+                           (initiated, negotiating_time, scheduled, reschedule_requested,
+                            meeting_executed, cancelled). Omit for all non-cancelled threads.
         """
         email = user_email.strip().lower()
         if not email:
             raise HTTPException(status_code=400, detail="user_email is required")
 
+        requested_statuses: set[str] = set()
+        if status_filter.strip():
+            requested_statuses = {s.strip() for s in status_filter.split(",") if s.strip()}
+
+        # By default only exclude cancelled; meeting_executed stays visible until the user dismisses
+        default_exclude = {"cancelled"}
+
         results = []
-        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=60)
         try:
             for doc in _threads_col().stream():
                 data = doc.to_dict() or {}
                 if str(data.get("user_email", "")).lower() != email:
                     continue
-                if str(data.get("status", "")).lower() != "active":
-                    continue
-                if str(data.get("state", "open")).lower() not in {"open", "active"}:
+                raw_status = str(data.get("status", "")).lower()
+                # Skip threads that have no recognised status
+                if raw_status not in {"active", "completed", "cancelled"}:
                     continue
                 updated = data.get("updated_at")
-                # Skip threads that haven't had activity in 30 days
                 if updated and hasattr(updated, "tzinfo"):
                     updated_aware = updated if updated.tzinfo else updated.replace(tzinfo=timezone.utc)
                     if updated_aware < cutoff:
                         continue
+
+                # Recompute thread_status live so it stays accurate even without cron
+                ts = compute_thread_status(data)
+                # Persist if it changed (lazy update)
+                if data.get("thread_status") != ts:
+                    save_thread(doc.id, {"thread_status": ts})
+
+                if requested_statuses:
+                    if ts not in requested_statuses:
+                        continue
+                else:
+                    if ts in default_exclude:
+                        continue
+
                 updated_iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
                 results.append({
+                    "thread_doc_id": doc.id,
                     "recipient_email": data.get("recipient_email", ""),
                     "recipient_name": data.get("recipient_name", ""),
                     "summary": data.get("summary", data.get("subject", "")),
                     "context": data.get("context", ""),
-                    "status": data.get("status", "active"),
+                    "status": raw_status,
+                    "thread_status": ts,
                     "turn_count": data.get("turn_count", 0),
                     "updated_at": updated_iso,
                     "sender_email": email,
                     "last_message_snippet": data.get("last_message_snippet", ""),
+                    "finalized_start_time": data.get("finalized_start_time", ""),
+                    "finalized_summary": data.get("finalized_summary", ""),
                 })
         except Exception as e:
             log_event("list_active_threads_failed", user_email=email, error=str(e))
@@ -104,39 +133,38 @@ def create_router(token_manager: TokenManager) -> APIRouter:
         recipient_email: str = "",
         meeting_title: str = "",
         access_token: str = "",
+        thread_doc_id: str = "",
     ):
         """
-        Return the email conversation for a specific active scheduling flow.
+        Return the email conversation for a specific scheduling flow.
 
         Query params:
-          sender_email    — the Kalendra account email (from FCM sender_email)
-          recipient_email — the recipient's email (from FCM recipient_email); optional fallback to scan
+          sender_email    — the Kalendra account email
+          thread_doc_id   — preferred: direct Firestore doc ID for exact lookup
+          recipient_email — fallback if thread_doc_id not provided
           meeting_title   — optional, for logging only
         """
         user_email = sender_email.strip().lower()
         recip_email = recipient_email.strip().lower()
+        doc_id = thread_doc_id.strip()
 
         if not user_email:
             raise HTTPException(status_code=400, detail="sender_email is required")
 
-        log_event("email_thread_fetch_requested", sender_email=user_email, recipient_email=recip_email)
+        log_event("email_thread_fetch_requested", sender_email=user_email, recipient_email=recip_email, thread_doc_id=doc_id)
 
         thread_data = None
         provider_found = None
 
-        # Primary lookup: exact match on recipient_email
-        for provider in ("google", "outlook"):
-            result = find_recent_active_thread_by_recipient(
-                provider=provider,
-                user_email=user_email,
-                recipient_email=recip_email,
-            )
-            if result.get("ok"):
-                thread_data = result["data"]
-                provider_found = provider
-                break
+        # Primary lookup: direct by thread_doc_id (works for any status)
+        if doc_id:
+            snap = _threads_col().document(doc_id).get()
+            if snap.exists:
+                data = snap.to_dict() or {}
+                thread_data = {"thread_doc_id": doc_id, **data}
+                provider_found = str(data.get("provider", "google")).lower()
 
-        # Fallback: scan all active threads for this user
+        # Fallback: scan by recipient_email (active threads only)
         if not thread_data:
             log_event("email_thread_recipient_lookup_miss", sender_email=user_email, recipient_email=recip_email)
             thread_data, provider_found = _scan_active_threads(user_email, recip_email)
