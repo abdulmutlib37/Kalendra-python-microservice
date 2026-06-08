@@ -272,15 +272,16 @@ def _handle_finalization(
         parts = conflict_start.split(" at ", 1)
         conflict_day = parts[0].strip() if parts else conflict_start
         conflict_time = parts[1].strip() if len(parts) > 1 else ""
-        send_intent_notification(
-            user_email=user_email,
-            recipient_name=thread_data.get("recipient_name", ""),
-            recipient_email=from_email,
-            meeting_title=thread_data.get("summary", ""),
-            intent="calendar_conflict",
-            conflict_day=conflict_day,
-            conflict_time=conflict_time,
-        )
+        # FCM NOTIFICATIONS DISABLED
+        # send_intent_notification(
+        #     user_email=user_email,
+        #     recipient_name=thread_data.get("recipient_name", ""),
+        #     recipient_email=from_email,
+        #     meeting_title=thread_data.get("summary", ""),
+        #     intent="calendar_conflict",
+        #     conflict_day=conflict_day,
+        #     conflict_time=conflict_time,
+        # )
         return False, f"I have a conflict at {conflict_start}. Should I book this anyway, or would you prefer a different slot?"
 
     existing_attendees = finalized_payload.get("attendees") or []
@@ -291,17 +292,19 @@ def _handle_finalization(
     create_result = create_calendar_event(token, finalized_payload, provider="outlook", refresh_access_token=refresh_fn)
     if create_result.get("ok"):
         friendly_time = format_event_time(finalized_payload.get("startTime", ""))
-        confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
-        _send_reply(token, user_email, message_id, confirm_text, refresh_fn,
-                    sender_name=thread_data.get("sender_name", ""))
-        send_flow_completed(
-            user_email=user_email,
-            recipient_name=thread_data.get("recipient_name", ""),
-            recipient_email=from_email,
-            meeting_title=finalized_payload.get("summary", ""),
-            start_time=finalized_payload.get("startTime", ""),
-            end_time=finalized_payload.get("endTime", ""),
-        )
+        # AUTO-REPLY DISABLED: confirmation reply commented out — Kalendra sends initial email only
+        # confirm_text = f"All set! We're confirmed for {friendly_time}. A calendar invite is on its way to you."
+        # _send_reply(token, user_email, message_id, confirm_text, refresh_fn,
+        #             sender_name=thread_data.get("sender_name", ""))
+        # FCM NOTIFICATIONS DISABLED
+        # send_flow_completed(
+        #     user_email=user_email,
+        #     recipient_name=thread_data.get("recipient_name", ""),
+        #     recipient_email=from_email,
+        #     meeting_title=finalized_payload.get("summary", ""),
+        #     start_time=finalized_payload.get("startTime", ""),
+        #     end_time=finalized_payload.get("endTime", ""),
+        # )
         completed_data = {
             "status": "completed",
             "state": "completed",
@@ -489,109 +492,111 @@ def process_outlook_push(push_payload: dict[str, Any], token_manager: TokenManag
             thread_status=str(thread_data.get("status", "active")),
         )
 
-        # Stalled check at turn 3 and turn 6 only
-        if should_fire_stalled(turn_count, convo):
-            send_intent_notification(
-                user_email=user_email,
-                recipient_name=thread_data.get("recipient_name", ""),
-                recipient_email=from_email,
-                meeting_title=strip_reply_prefix(msg.get("subject", "")),
-                intent="stalled",
-            )
+        # FCM NOTIFICATIONS DISABLED
+        # if should_fire_stalled(turn_count, convo):
+        #     send_intent_notification(
+        #         user_email=user_email,
+        #         recipient_name=thread_data.get("recipient_name", ""),
+        #         recipient_email=from_email,
+        #         meeting_title=strip_reply_prefix(msg.get("subject", "")),
+        #         intent="stalled",
+        #     )
 
         guardrail_text = _guardrail_reply(convo)
         if guardrail_text:
-            if _send_reply(token, user_email, message_id, guardrail_text, refresh_fn,
-                       sender_name=thread_data.get("sender_name", "")):
-                replied += 1
-                updated_g = {
-                    "gmail_thread_id": thread_id, "status": "active", "state": "open",
-                    "turn_count": turn_count + 1, "last_message_id": message_id,
-                    "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
-                    "conversation_messages": (convo + [f"From: {user_email}\n{guardrail_text}"])[-30:],
-                }
-                updated_g["thread_status"] = compute_thread_status({**thread_data, **updated_g})
-                save_thread(thread_doc_id, updated_g)
+            # AUTO-REPLY DISABLED: _send_reply commented out — Kalendra sends initial email only
+            # if _send_reply(token, user_email, message_id, guardrail_text, refresh_fn,
+            #            sender_name=thread_data.get("sender_name", "")):
+            #     replied += 1
+            #     updated_g = {
+            #         "gmail_thread_id": thread_id, "status": "active", "state": "open",
+            #         "turn_count": turn_count + 1, "last_message_id": message_id,
+            #         "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+            #         "conversation_messages": (convo + [f"From: {user_email}\n{guardrail_text}"])[-30:],
+            #     }
+            #     updated_g["thread_status"] = compute_thread_status({**thread_data, **updated_g})
+            #     save_thread(thread_doc_id, updated_g)
             continue
 
         if turn_count >= 10:
-            closing_text = "It seems we're having trouble finding a time. Feel free to reply whenever you have a slot that works, and I'll get it booked right away."
-            if _send_reply(token, user_email, message_id, closing_text, refresh_fn,
-                           sender_name=thread_data.get("sender_name", "")):
-                replied += 1
-                save_thread(thread_doc_id, {
-                    "turn_count": turn_count + 1, "last_message_id": message_id,
-                    "conversation_messages": (convo + [f"From: {user_email}\n{closing_text}"])[-30:],
-                })
+            # AUTO-REPLY DISABLED: _send_reply commented out — Kalendra sends initial email only
+            # closing_text = "It seems we're having trouble finding a time. Feel free to reply whenever you have a slot that works, and I'll get it booked right away."
+            # if _send_reply(token, user_email, message_id, closing_text, refresh_fn,
+            #                sender_name=thread_data.get("sender_name", "")):
+            #     replied += 1
+            #     save_thread(thread_doc_id, {
+            #         "turn_count": turn_count + 1, "last_message_id": message_id,
+            #         "conversation_messages": (convo + [f"From: {user_email}\n{closing_text}"])[-30:],
+            #     })
             continue
 
-        reply_text, finalized_payload = generate_scheduling_reply(
-            thread_messages=convo, access_token=token, provider="outlook",
-            sender_name=thread_data.get("sender_name", "Scheduler Team"),
-            context=thread_data.get("context", "Schedule a meeting via email."),
-            refresh_access_token=refresh_fn,
-            user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
-            user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
-            turn_count=turn_count,
-            recipient_email=thread_data.get("recipient_email", ""),
-            recipient_name=thread_data.get("recipient_name", ""),
-        )
-        if not reply_text and not finalized_payload:
-            continue
+        # AUTO-REPLY DISABLED: LLM reply generation and calendar booking disabled — Kalendra sends initial email only
+        # reply_text, finalized_payload = generate_scheduling_reply(
+        #     thread_messages=convo, access_token=token, provider="outlook",
+        #     sender_name=thread_data.get("sender_name", "Scheduler Team"),
+        #     context=thread_data.get("context", "Schedule a meeting via email."),
+        #     refresh_access_token=refresh_fn,
+        #     user_timezone=(thread_data.get("user_timezone") or "").strip() or None,
+        #     user_timezone_offset_minutes=thread_data.get("user_timezone_offset_minutes"),
+        #     turn_count=turn_count,
+        #     recipient_email=thread_data.get("recipient_email", ""),
+        #     recipient_name=thread_data.get("recipient_name", ""),
+        # )
+        # if not reply_text and not finalized_payload:
+        #     continue
 
-        if finalized_payload and not _has_explicit_rejection(convo):
-            did_finalize, fallback_text = _handle_finalization(
-                token, user_email, from_email, message_id, thread_id,
-                thread_doc_id, thread_data, finalized_payload, convo, refresh_fn,
-            )
-            if did_finalize:
-                finalized += 1
-                replied += 1
-                continue
-            elif fallback_text:
-                reply_text = fallback_text
+        # if finalized_payload and not _has_explicit_rejection(convo):
+        #     did_finalize, fallback_text = _handle_finalization(
+        #         token, user_email, from_email, message_id, thread_id,
+        #         thread_doc_id, thread_data, finalized_payload, convo, refresh_fn,
+        #     )
+        #     if did_finalize:
+        #         finalized += 1
+        #         replied += 1
+        #         continue
+        #     elif fallback_text:
+        #         reply_text = fallback_text
 
-        if not reply_text:
-            continue
-        if _send_reply(token, user_email, message_id, reply_text, refresh_fn,
-                       sender_name=thread_data.get("sender_name", "")):
-            # new_time_suggestion / reschedule_booked / cancelled — calendar_conflict fires in _handle_finalization, stalled above
-            classified_intent = intent_result.get("intent")
-            if classified_intent not in ("none", None):
-                send_intent_notification(
-                    user_email=user_email,
-                    recipient_name=thread_data.get("recipient_name", ""),
-                    recipient_email=from_email,
-                    meeting_title=strip_reply_prefix(msg.get("subject", "")),
-                    intent=classified_intent,
-                    proposed_day=intent_result.get("proposed_day", ""),
-                    proposed_time=intent_result.get("proposed_time", ""),
-                )
-            # Fire conflict notification if recipient mentioned a busy/conflict time
-            if intent_result.get("conflict_day") or intent_result.get("conflict_time"):
-                send_intent_notification(
-                    user_email=user_email,
-                    recipient_name=thread_data.get("recipient_name", ""),
-                    recipient_email=from_email,
-                    meeting_title=strip_reply_prefix(msg.get("subject", "")),
-                    intent="calendar_conflict",
-                    conflict_day=intent_result.get("conflict_day", ""),
-                    conflict_time=intent_result.get("conflict_time", ""),
-                )
-            replied += 1
-            updated_r = {
-                "gmail_thread_id": thread_id, "status": "active", "state": "open",
-                "turn_count": turn_count + 1, "last_message_id": message_id,
-                "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
-                "conversation_messages": (convo + [f"From: {user_email}\n{reply_text}"])[-30:],
-            }
-            if classified_intent == "cancelled":
-                updated_r["status"] = "cancelled"
-                updated_r["state"] = "cancelled"
-            elif classified_intent == "reschedule_booked" and str(thread_data.get("status", "")).lower() == "completed":
-                updated_r["status"] = "completed"
-                updated_r["state"] = "completed"
-            updated_r["thread_status"] = compute_thread_status({**thread_data, **updated_r}, intent=classified_intent or "")
-            save_thread(thread_doc_id, updated_r)
+        # if not reply_text:
+        #     continue
+        # if _send_reply(token, user_email, message_id, reply_text, refresh_fn,
+        #                sender_name=thread_data.get("sender_name", "")):
+
+        # FCM NOTIFICATIONS DISABLED
+        classified_intent = intent_result.get("intent")
+        # if classified_intent not in ("none", None):
+        #     send_intent_notification(
+        #         user_email=user_email,
+        #         recipient_name=thread_data.get("recipient_name", ""),
+        #         recipient_email=from_email,
+        #         meeting_title=strip_reply_prefix(msg.get("subject", "")),
+        #         intent=classified_intent,
+        #         proposed_day=intent_result.get("proposed_day", ""),
+        #         proposed_time=intent_result.get("proposed_time", ""),
+        #     )
+        # if intent_result.get("conflict_day") or intent_result.get("conflict_time"):
+        #     send_intent_notification(
+        #         user_email=user_email,
+        #         recipient_name=thread_data.get("recipient_name", ""),
+        #         recipient_email=from_email,
+        #         meeting_title=strip_reply_prefix(msg.get("subject", "")),
+        #         intent="calendar_conflict",
+        #         conflict_day=intent_result.get("conflict_day", ""),
+        #         conflict_time=intent_result.get("conflict_time", ""),
+        #     )
+        updated_r = {
+            "gmail_thread_id": thread_id, "status": "active", "state": "open",
+            "last_message_id": message_id,
+            "attendees": list(set((thread_data.get("attendees") or []) + [from_email])),
+            "conversation_messages": convo[-30:],
+        }
+        if classified_intent == "cancelled":
+            updated_r["status"] = "cancelled"
+            updated_r["state"] = "cancelled"
+        elif classified_intent == "reschedule_booked" and str(thread_data.get("status", "")).lower() == "completed":
+            updated_r["status"] = "completed"
+            updated_r["state"] = "completed"
+        updated_r["thread_status"] = compute_thread_status({**thread_data, **updated_r}, intent=classified_intent or "")
+        save_thread(thread_doc_id, updated_r)
 
     return {"ok": True, "data": {"replied_count": replied, "finalized_count": finalized}}
